@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# STM32CubeIDE build output
+Debug/
+Release/
+
+# Build artifacts
+*.o
+*.d
+*.elf
+*.map
+*.list
+*.su
+*.cyclo
+*.bin
+*.hex
+
+# Local launch/debug state
+*.launch
+
