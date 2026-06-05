@@ -3,12 +3,13 @@
 
 #include "main.h"
 
+#define WS2812_EDGE_ZONE_COUNT 136U  /* DCMI input zones; physical LED count is 135 */
+
 void WS2812_Init(void);
-void WS2812_Task(uint32_t brightness_percent);
-void WS2812_TaskZones(uint32_t zone0_percent,
-                      uint32_t zone1_percent,
-                      uint32_t zone2_percent,
-                      uint32_t zone3_percent);
+void WS2812_TaskEdgeZonesRgb(const volatile uint32_t *zone_r,
+                             const volatile uint32_t *zone_g,
+                             const volatile uint32_t *zone_b,
+                             uint32_t zone_count);
 void WS2812_Clear(void);
 
 #endif

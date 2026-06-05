@@ -1,59 +1,56 @@
 # TFP401 to STM32F407 Pin Map
 
-## Current Bring-Up Wiring
+## Current DCMI Wiring
 
-The current firmware only tests HDMI decoder timing signals.
+The current firmware captures an 8-bit RGB332 DCMI stream from the TFP401,
+decodes approximate RGB values, and drives the WS2812 zones from those values.
 
 | TFP401 40-pin signal | TFP401 pin | STM32F407 pin | Firmware role |
 |---|---:|---|---|
 | GND | 3, 29, or 36 | GND | Common reference |
-| DCLK / PCLK / DOTCLK | 30 | PE6 | Pixel clock activity check |
-| HSYNC | 32 | PB8 | EXTI interrupt counter |
-| VSYNC | 33 | PB7 | EXTI interrupt counter |
+| DCLK / PCLK / DOTCLK | 30 | PA6 | DCMI_PIXCLK |
+| HSYNC | 32 | PA4 | DCMI_HSYNC |
+| VSYNC | 33 | PB7 | DCMI_VSYNC |
+| B6 | 27 | PC6 | DCMI_D0 |
+| B7 | 28 | PC7 | DCMI_D1 |
+| G5 | 18 | PC8 | DCMI_D2 |
+| G6 | 19 | PC9 | DCMI_D3 |
+| G7 | 20 | PE4 | DCMI_D4 |
+| R5 | 10 | PB6 | DCMI_D5 |
+| R6 | 11 | PE5 | DCMI_D6 |
+| R7 | 12 | PE6 | DCMI_D7 |
 
-Do not connect RGB data yet.
+## RGB332 Color Wiring
 
-## Onboard LED Status
-
-| STM32F407 Discovery LED | Pin | Meaning |
-|---|---|---|
-| Green | PD12 | VSYNC was detected in the last 500 ms window |
-| Orange | PD13 | HSYNC was detected in the last 500 ms window |
-| Red | PD14 | PCLK activity was detected by rough polling |
-| Blue | PD15 | Firmware heartbeat |
-
-## CubeIDE Watch Variables
-
-Add these to CubeIDE Expressions:
-
-```c
-g_video_vsync_total
-g_video_hsync_total
-g_video_pclk_total
-g_video_vsync_window
-g_video_hsync_window
-g_video_pclk_window
-```
-
-Interpretation:
+The DCMI data bus packs the strongest color bits as RGB332:
 
 ```text
-*_total  = cumulative count since reset
-*_window = count observed during the last 500 ms status window
+bit 7..5 = R7..R5
+bit 4..2 = G7..G5
+bit 1..0 = B7..B6
 ```
 
-Expected first successful state:
+| TFP401 signal | TFP401 pin | STM32F407 DCMI pin | Captured bit |
+|---|---:|---|---:|
+| B6 | 27 | PC6 / DCMI_D0 | 0 |
+| B7 | 28 | PC7 / DCMI_D1 | 1 |
+| G5 | 18 | PC8 / DCMI_D2 | 2 |
+| G6 | 19 | PC9 / DCMI_D3 | 3 |
+| G7 | 20 | PE4 / DCMI_D4 | 4 |
+| R5 | 10 | PB6 / DCMI_D5 | 5 |
+| R6 | 11 | PE5 / DCMI_D6 | 6 |
+| R7 | 12 | PE6 / DCMI_D7 | 7 |
 
-```text
-g_video_vsync_total increases
-g_video_hsync_total increases
-g_video_pclk_total may be unreliable until DCMI/timer capture is added
-```
+Watch `g_dcmi_average_r`, `g_dcmi_average_g`, and `g_dcmi_average_b` while
+showing full-screen red, green, blue, white, and black.
 
 ## Notes
 
 - TFP401 is powered by USB during bring-up.
-- STM32 is powered/debugged through ST-LINK/USB.
+- STM32 is powered and flashed through ST-LINK.
 - Grounds must be connected together.
-- PCLK is too fast for the current polling method to measure accurately. The current PCLK check only proves rough activity.
-- PA4 and PA6 are avoided on the STM32F407 Discovery board because they are shared with onboard audio/MEMS circuitry.
+- PA4 and PA6 were tested and are usable for DCMI on this STM32F407 Discovery board.
+- The RGB332 mapping is a first color milestone. If color banding is too visible,
+  the upgrade path is a wider DCMI mode such as RGB444.
+- Current firmware drives the mounted 136 LEDs as one software zone per active
+  LED. The earlier LEDs on the 300 LED strip are intentionally left off.
