@@ -6,17 +6,21 @@
 #define VIDEO_ACTIVE_WIDTH 1280U
 #define VIDEO_ACTIVE_HEIGHT 720U
 #define EDGE_BORDER_PIXELS 16U
+#define DCMI_SIDE_CROP_WIDTH 28U
+#define DCMI_TOP_CROP_INSET_LINES 32U
+#define DCMI_BOTTOM_CROP_INSET_LINES 32U
 #define DCMI_EDGE_TOP_BOTTOM_SAMPLES (VIDEO_ACTIVE_WIDTH * EDGE_BORDER_PIXELS)
-#define DCMI_EDGE_SIDE_SAMPLES (EDGE_BORDER_PIXELS * VIDEO_ACTIVE_HEIGHT)
+#define DCMI_EDGE_SIDE_SAMPLES (DCMI_SIDE_CROP_WIDTH * VIDEO_ACTIVE_HEIGHT)
 #define DCMI_CAPTURE_MAX_SAMPLES \
     ((DCMI_EDGE_TOP_BOTTOM_SAMPLES > DCMI_EDGE_SIDE_SAMPLES) ? \
       DCMI_EDGE_TOP_BOTTOM_SAMPLES : DCMI_EDGE_SIDE_SAMPLES)
 #define DCMI_CAPTURE_MAX_WORDS (DCMI_CAPTURE_MAX_SAMPLES / 4U)
 #define DCMI_RESTART_DELAY_MS 1U
-#define DCMI_CAPTURE_TIMEOUT_MS 24U
+#define DCMI_CAPTURE_TIMEOUT_MS 50U
 /* Large edge crops need enough samples to cover the full LED geometry.
  * With 1280x720:
- * - complete side crop (16x720) = 2880 words
+ * - complete side crop (28x720) = 5040 words; only the outer 16 pixels
+ *   are used for LED color so the crop still represents the screen edge.
  * - top/bottom crop (1280x16) = 5120 words
  */
 /* Responsive low-data mode:
@@ -29,16 +33,20 @@
 #define DCMI_SIDE_EARLY_ACCEPT 1700U
 #define DCMI_TIMEOUT_ACCEPT_FLOOR_TOP_BOTTOM 1200U
 #define DCMI_TIMEOUT_ACCEPT_FLOOR_SIDE 1100U
-#define DCMI_SYNC_WAIT_TIMEOUT_MS 20U
-/* Diagnostic mode: capture from the raw active stream without DCMI crop
- * programming. If DMA fills here, the signal path is healthy and the fault
- * is isolated to crop coordinates/timing rather than PIXCLK/HSYNC/data.
+#define DCMI_SYNC_WAIT_TIMEOUT_MS 50U
+/* Set to 1 only when validating crop hardware with a fixed 1280x16 test
+ * rectangle. Normal ambilight operation keeps crop enabled but lets the
+ * perimeter scheduler cycle all four edge windows.
  */
-#define DCMI_USE_CROP 0U
+#define DCMI_CROP_TEST_MODE 0U
+#define DCMI_CROP_TEST_CAPTURE_TIMEOUT_MS 50U
+#define DCMI_USE_CROP 1U
+#define DCMI_PREARM_CAPTURE 1U
 #define DCMI_LED_ACTIVITY_WINDOW_MS 1000U
-/* Approach B: capture true full-resolution perimeter crops. The sides are
- * 16 x full-height rectangles again, not timed horizontal bands, so every side
- * zone can update once per perimeter cycle.
+#define DCMI_SIDE_HORIZONTAL_BANDS 1U
+/* Side edges use reliable 1280x16 horizontal bands instead of tall/narrow
+ * vertical crops. The TFP401/DCMI path fills short bands reliably; full-height
+ * side crops can cross VSYNC and drop to zero words.
  */
 #define DCMI_BOTTOM_TIMED_BAND 0U
 #define DCMI_BOTTOM_START_DELAY_MS 8U
@@ -145,10 +153,10 @@ typedef struct {
  * start_snapshot() converts cartesian y to DCMI y before programming the crop.
  */
 static const dcmi_edge_crop_t edge_crops[DCMI_EDGE_COUNT] = {
-    [DCMI_EDGE_TOP] = {0U, VIDEO_ACTIVE_HEIGHT - EDGE_BORDER_PIXELS, VIDEO_ACTIVE_WIDTH, EDGE_BORDER_PIXELS, 1U},
-    [DCMI_EDGE_RIGHT] = {VIDEO_ACTIVE_WIDTH - EDGE_BORDER_PIXELS, 0U, EDGE_BORDER_PIXELS, VIDEO_ACTIVE_HEIGHT, 0U},
-    [DCMI_EDGE_BOTTOM] = {0U, 0U, VIDEO_ACTIVE_WIDTH, EDGE_BORDER_PIXELS, 3U},
-    [DCMI_EDGE_LEFT] = {0U, 0U, EDGE_BORDER_PIXELS, VIDEO_ACTIVE_HEIGHT, 2U},
+    [DCMI_EDGE_TOP] = {0U, VIDEO_ACTIVE_HEIGHT - EDGE_BORDER_PIXELS - DCMI_TOP_CROP_INSET_LINES, VIDEO_ACTIVE_WIDTH, EDGE_BORDER_PIXELS, 1U},
+    [DCMI_EDGE_RIGHT] = {VIDEO_ACTIVE_WIDTH - DCMI_SIDE_CROP_WIDTH, 0U, DCMI_SIDE_CROP_WIDTH, VIDEO_ACTIVE_HEIGHT, 0U},
+    [DCMI_EDGE_BOTTOM] = {0U, DCMI_BOTTOM_CROP_INSET_LINES, VIDEO_ACTIVE_WIDTH, EDGE_BORDER_PIXELS, 3U},
+    [DCMI_EDGE_LEFT] = {0U, 0U, DCMI_SIDE_CROP_WIDTH, VIDEO_ACTIVE_HEIGHT, 2U},
 };
 
 static uint32_t g_dcmi_state;
@@ -219,14 +227,45 @@ static uint32_t g_dcmi_edge_zero_count[DCMI_EDGE_COUNT];
 static uint32_t g_dcmi_edge_last_words[DCMI_EDGE_COUNT];
 static uint32_t g_dcmi_sync_wait_status;
 static uint32_t g_dcmi_sync_wait_ms;
+#if !DCMI_CROP_TEST_MODE && !DCMI_PREARM_CAPTURE
 static uint32_t g_dcmi_sync_period_ms;
 static uint32_t g_dcmi_sync_rate_hz;
+#endif
 static uint32_t g_dcmi_dma_ndtr_last;
 static uint32_t g_dcmi_sr_last;
 static uint32_t g_dcmi_ris_last;
 static uint32_t g_dcmi_mis_last;
 static uint32_t g_dcmi_cr_last;
 static uint32_t g_dcmi_dma_lisr_last;
+static volatile uint32_t g_dcmi_crop_test_mode = DCMI_CROP_TEST_MODE;
+static volatile uint32_t g_dcmi_crop_config_status;
+static volatile uint32_t g_dcmi_crop_enable_status;
+static volatile uint32_t g_dcmi_crop_programmed_x;
+static volatile uint32_t g_dcmi_crop_programmed_y;
+static volatile uint32_t g_dcmi_crop_programmed_width;
+static volatile uint32_t g_dcmi_crop_programmed_height;
+static volatile uint32_t g_dcmi_crop_cwstrtr;
+static volatile uint32_t g_dcmi_crop_cwsizer;
+static volatile uint32_t g_dcmi_crop_cr_after_enable;
+static volatile uint32_t g_dcmi_crop_test_last_words;
+static volatile uint32_t g_dcmi_crop_test_max_words;
+static volatile uint32_t g_dcmi_crop_test_full_count;
+static volatile uint32_t g_dcmi_crop_test_start_mode;
+/* 3 = pre-armed continuous capture without a manual VSYNC wait. */
+static volatile uint32_t g_dcmi_crop_test_strategy;
+static volatile uint32_t g_dcmi_crop_test_prearmed_count;
+static volatile uint32_t g_dcmi_crop_test_hsync_high;
+static volatile uint32_t g_dcmi_crop_test_hsync_high_attempts;
+static volatile uint32_t g_dcmi_crop_test_hsync_low_attempts;
+static volatile uint32_t g_dcmi_crop_test_hsync_high_max_words;
+static volatile uint32_t g_dcmi_crop_test_hsync_low_max_words;
+static volatile uint32_t g_dcmi_crop_test_hsync_high_full_count;
+static volatile uint32_t g_dcmi_crop_test_hsync_low_full_count;
+/* Sync-combo index: bit 0 = HSYNC high, bit 1 = VSYNC high. */
+static volatile uint32_t g_dcmi_crop_test_sync_combo;
+static volatile uint32_t g_dcmi_crop_test_sync_attempts[4];
+static volatile uint32_t g_dcmi_crop_test_sync_max_words[4];
+static volatile uint32_t g_dcmi_crop_test_sync_full_count[4];
 static uint32_t g_dcmi_led_update_pending;
 static uint32_t g_dcmi_zone_update_count;
 /* Per-edge zone statistics */
@@ -260,8 +299,25 @@ static uint32_t g_dcmi_top_mid_b;
 static uint32_t g_dcmi_top_last_r;
 static uint32_t g_dcmi_top_last_g;
 static uint32_t g_dcmi_top_last_b;
+static uint32_t g_dcmi_top_raw_color_spread;
+static uint32_t g_dcmi_top_raw_first_r;
+static uint32_t g_dcmi_top_raw_first_g;
+static uint32_t g_dcmi_top_raw_first_b;
+static uint32_t g_dcmi_top_raw_mid_r;
+static uint32_t g_dcmi_top_raw_mid_g;
+static uint32_t g_dcmi_top_raw_mid_b;
+static uint32_t g_dcmi_top_raw_last_r;
+static uint32_t g_dcmi_top_raw_last_g;
+static uint32_t g_dcmi_top_raw_last_b;
+static uint32_t g_dcmi_top_first_samples;
+static uint32_t g_dcmi_top_mid_samples;
+static uint32_t g_dcmi_top_last_samples;
 static uint32_t g_dcmi_right_band_index;
 static uint32_t g_dcmi_left_band_index;
+static uint32_t g_dcmi_right_band_last_words[DCMI_RIGHT_ZONE_COUNT];
+static uint32_t g_dcmi_left_band_last_words[DCMI_LEFT_ZONE_COUNT];
+static uint32_t g_dcmi_right_band_max_words[DCMI_RIGHT_ZONE_COUNT];
+static uint32_t g_dcmi_left_band_max_words[DCMI_LEFT_ZONE_COUNT];
 volatile uint32_t g_dcmi_led_zone_r[DCMI_LED_ZONE_COUNT];
 volatile uint32_t g_dcmi_led_zone_g[DCMI_LED_ZONE_COUNT];
 volatile uint32_t g_dcmi_led_zone_b[DCMI_LED_ZONE_COUNT];
@@ -283,7 +339,9 @@ static volatile uint32_t dcmi_buffer_ready;
 static volatile uint32_t last_frame_time_ms;
 static volatile uint32_t last_error_time_ms;
 static volatile uint32_t dcmi_stop_requested;
+#if !DCMI_CROP_TEST_MODE && !DCMI_PREARM_CAPTURE
 static uint32_t last_sync_tick_ms;
+#endif
 static uint32_t active_crop_index;
 static uint32_t next_crop_index;
 static uint32_t active_capture_samples;
@@ -297,7 +355,9 @@ static uint32_t next_left_band_index;
 static uint32_t next_side_band_start_ms = 0U;
 static uint32_t next_bottom_band_start_ms = 0U;
 #endif
+#if !DCMI_SIDE_HORIZONTAL_BANDS
 static uint32_t perimeter_edges_done_mask;
+#endif
 static volatile uint32_t active_captured_words;
 static uint32_t led_zone_red_sum[DCMI_LED_ZONE_COUNT];
 static uint32_t led_zone_green_sum[DCMI_LED_ZONE_COUNT];
@@ -313,31 +373,59 @@ static uint16_t rgb332_weight_lut[256];
 
 static void init_rgb332_weight_lut(void);
 static uint32_t rescale_with_baseline(uint32_t value, uint32_t baseline);
-static uint32_t zone_expected_in_current_capture(uint32_t zone);
 static uint32_t cartesian_y_to_dcmi_y(uint32_t cart_y, uint32_t height);
 static uint32_t edge_zone_count(uint32_t edge);
 static uint32_t edge_zone_offset(uint32_t edge);
 static uint32_t edge_local_zone(uint32_t edge, uint32_t x, uint32_t y,
                                 uint32_t width, uint32_t height);
+static void side_band_zone_pair(uint32_t *right_zone, uint32_t *left_zone);
+static void accumulate_led_zone_sample(uint32_t led_zone,
+                                       uint32_t sample,
+                                       uint32_t red,
+                                       uint32_t green,
+                                       uint32_t blue);
 static uint32_t capture_accept_words(void);
 static uint32_t capture_min_accept_words(void);
+#if DCMI_SIDE_HORIZONTAL_BANDS
+static uint32_t side_band_cartesian_y(uint32_t edge, uint32_t band_index);
+#endif
+#if !DCMI_SIDE_HORIZONTAL_BANDS
 static void begin_perimeter_cycle_if_needed(void);
 static uint32_t mark_current_perimeter_edge_done(void);
+#endif
 static uint32_t blend_channel(uint32_t prev_value,
                               uint32_t raw_value,
                               uint32_t alpha_num,
                               uint32_t alpha_den);
-static void finalize_perimeter_cycle(void);
+static void reset_zone_accumulator(uint32_t zone_index);
+static uint32_t apply_sampled_zone(uint32_t zone_index,
+                                   uint32_t *frame_delta_max,
+                                   uint32_t *frame_delta_sum,
+                                   uint32_t *frame_delta_count,
+                                   uint32_t *frame_spike_reject,
+                                   uint32_t *frame_low_trust_spike);
+#if DCMI_SIDE_HORIZONTAL_BANDS
+static uint32_t zone_in_current_capture(uint32_t zone_index);
 static void clear_current_capture_zones(void);
+static void finalize_incremental_capture(void);
+#endif
+#if !DCMI_SIDE_HORIZONTAL_BANDS
+static void finalize_perimeter_cycle(void);
+#endif
 static void mark_crop_accept(uint32_t early_accept);
 static void mark_crop_zero(void);
+static void advance_side_band_index(void);
+static void record_side_band_words(uint32_t words);
 
 static void start_snapshot(void);
+#if !DCMI_CROP_TEST_MODE && !DCMI_PREARM_CAPTURE
 static uint32_t wait_for_frame_boundary(void);
+#endif
 static void analyze_buffer(void);
 
 void DCMI_Capture_Init(void)
 {
+    g_dcmi_crop_test_mode = DCMI_CROP_TEST_MODE;
     init_rgb332_weight_lut();
     dcmi_status.state = DCMI_CAPTURE_READY;
     g_dcmi_state = DCMI_CAPTURE_READY;
@@ -364,6 +452,23 @@ void DCMI_Capture_Task(void)
             HAL_DCMI_Stop(&hdcmi);
             active_captured_words = active_capture_words;
             g_dcmi_captured_words = active_captured_words;
+            g_dcmi_crop_test_last_words = active_captured_words;
+            if (active_captured_words > g_dcmi_crop_test_max_words) {
+                g_dcmi_crop_test_max_words = active_captured_words;
+            }
+            g_dcmi_crop_test_full_count++;
+#if DCMI_CROP_TEST_MODE
+            g_dcmi_crop_test_sync_max_words[g_dcmi_crop_test_sync_combo] =
+                active_captured_words;
+            g_dcmi_crop_test_sync_full_count[g_dcmi_crop_test_sync_combo]++;
+            if (g_dcmi_crop_test_hsync_high != 0U) {
+                g_dcmi_crop_test_hsync_high_max_words = active_captured_words;
+                g_dcmi_crop_test_hsync_high_full_count++;
+            } else {
+                g_dcmi_crop_test_hsync_low_max_words = active_captured_words;
+                g_dcmi_crop_test_hsync_low_full_count++;
+            }
+#endif
             mark_crop_accept(0U);
             last_frame_time_ms = HAL_GetTick();
             dcmi_status.frames_seen++;
@@ -400,7 +505,13 @@ void DCMI_Capture_Task(void)
             }
         }
 
-        if ((HAL_GetTick() - last_restart_ms) >= DCMI_CAPTURE_TIMEOUT_MS) {
+        if ((HAL_GetTick() - last_restart_ms) >=
+#if DCMI_CROP_TEST_MODE
+            DCMI_CROP_TEST_CAPTURE_TIMEOUT_MS
+#else
+            DCMI_CAPTURE_TIMEOUT_MS
+#endif
+            ) {
             active_captured_words = 0U;
 
             if (hdcmi.DMA_Handle != NULL &&
@@ -416,6 +527,24 @@ void DCMI_Capture_Task(void)
             g_dcmi_dma_lisr_last = DMA2->LISR;
             HAL_DCMI_Stop(&hdcmi);
             g_dcmi_captured_words = active_captured_words;
+            g_dcmi_crop_test_last_words = active_captured_words;
+            if (active_captured_words > g_dcmi_crop_test_max_words) {
+                g_dcmi_crop_test_max_words = active_captured_words;
+            }
+#if DCMI_CROP_TEST_MODE
+            if (active_captured_words >
+                g_dcmi_crop_test_sync_max_words[g_dcmi_crop_test_sync_combo]) {
+                g_dcmi_crop_test_sync_max_words[g_dcmi_crop_test_sync_combo] =
+                    active_captured_words;
+            }
+            if (g_dcmi_crop_test_hsync_high != 0U) {
+                if (active_captured_words > g_dcmi_crop_test_hsync_high_max_words) {
+                    g_dcmi_crop_test_hsync_high_max_words = active_captured_words;
+                }
+            } else if (active_captured_words > g_dcmi_crop_test_hsync_low_max_words) {
+                g_dcmi_crop_test_hsync_low_max_words = active_captured_words;
+            }
+#endif
             g_dcmi_timeout_count++;
             if (active_crop_index < DCMI_EDGE_COUNT) {
                 g_dcmi_edge_timeout_count[active_crop_index]++;
@@ -545,6 +674,12 @@ void HAL_DCMI_VsyncEventCallback(DCMI_HandleTypeDef *hdcmi_arg)
 
 static void start_snapshot(void)
 {
+#if DCMI_SIDE_HORIZONTAL_BANDS
+    if (next_crop_index == DCMI_EDGE_LEFT) {
+        next_crop_index = DCMI_EDGE_TOP;
+    }
+#endif
+
     const dcmi_edge_crop_t *crop = &edge_crops[next_crop_index];
     HAL_StatusTypeDef crop_status;
     uint32_t crop_x = crop->x;
@@ -564,7 +699,40 @@ static void start_snapshot(void)
                                   DCMI_FLAG_ERRRI | DCMI_FLAG_VSYNCRI |
                                   DCMI_FLAG_LINERI);
 
+#if DCMI_CROP_TEST_MODE
+    /* Sweep all hardware-sync polarity combinations. Display-style HSYNC and
+     * VSYNC are short blanking pulses, while DCMI expects active line/frame
+     * windows. The four-way result separates a polarity issue from a signal
+     * semantics/wiring issue.
+     */
+    g_dcmi_crop_test_sync_combo = g_dcmi_crop_test_prearmed_count & 3U;
+    g_dcmi_crop_test_sync_attempts[g_dcmi_crop_test_sync_combo]++;
+    g_dcmi_crop_test_hsync_high = g_dcmi_crop_test_sync_combo & 1U;
+    if (g_dcmi_crop_test_hsync_high != 0U) {
+        DCMI->CR |= DCMI_CR_HSPOL;
+        g_dcmi_crop_test_hsync_high_attempts++;
+    } else {
+        DCMI->CR &= ~DCMI_CR_HSPOL;
+        g_dcmi_crop_test_hsync_low_attempts++;
+    }
+    if ((g_dcmi_crop_test_sync_combo & 2U) != 0U) {
+        DCMI->CR |= DCMI_CR_VSPOL;
+    } else {
+        DCMI->CR &= ~DCMI_CR_VSPOL;
+    }
+#endif
+
     active_crop_index = next_crop_index;
+#if DCMI_CROP_TEST_MODE
+    /* Use the simplest possible crop: first active line/pixel, full width,
+     * 16 lines deep. The Cartesian Y value converts to DCMI Y=0 below.
+     */
+    active_crop_index = DCMI_EDGE_TOP;
+    crop_x = 0U;
+    crop_y = VIDEO_ACTIVE_HEIGHT - EDGE_BORDER_PIXELS;
+    crop_width = VIDEO_ACTIVE_WIDTH;
+    crop_height = EDGE_BORDER_PIXELS;
+#endif
     if (active_crop_index == DCMI_EDGE_RIGHT) {
         active_side_band_index = next_right_band_index;
     } else if (active_crop_index == DCMI_EDGE_LEFT) {
@@ -575,6 +743,16 @@ static void start_snapshot(void)
     if (active_crop_index < DCMI_EDGE_COUNT) {
         g_dcmi_edge_attempt_count[active_crop_index]++;
     }
+
+    #if DCMI_SIDE_HORIZONTAL_BANDS
+    if (active_crop_index == DCMI_EDGE_RIGHT ||
+        active_crop_index == DCMI_EDGE_LEFT) {
+        crop_x = 0U;
+        crop_y = side_band_cartesian_y(active_crop_index, active_side_band_index);
+        crop_width = VIDEO_ACTIVE_WIDTH;
+        crop_height = EDGE_BORDER_PIXELS;
+    }
+    #endif
 
     #if DCMI_BOTTOM_TIMED_BAND
     if (active_crop_index == DCMI_EDGE_RIGHT ||
@@ -619,20 +797,30 @@ static void start_snapshot(void)
     g_dcmi_left_band_index = next_left_band_index;
 
     #if DCMI_USE_CROP
+    g_dcmi_crop_programmed_x = crop_x;
+    g_dcmi_crop_programmed_y = dcmi_y;
+    g_dcmi_crop_programmed_width = crop_width;
+    g_dcmi_crop_programmed_height = crop_height;
     crop_status = HAL_DCMI_ConfigCrop(&hdcmi,
                                       crop_x,
                                       dcmi_y,
                                       crop_width - 1U,
                                       crop_height - 1U);
+    g_dcmi_crop_config_status = (uint32_t)crop_status;
     if (crop_status == HAL_OK) {
         HAL_StatusTypeDef crop_enable_status = HAL_DCMI_EnableCrop(&hdcmi);
+        g_dcmi_crop_enable_status = (uint32_t)crop_enable_status;
         if (crop_enable_status != HAL_OK) {
             (void)HAL_DCMI_DisableCrop(&hdcmi);
         }
     } else {
+        g_dcmi_crop_enable_status = 0xFFFFFFFFU;
         /* Keep capture alive even when per-crop programming fails. */
         (void)HAL_DCMI_DisableCrop(&hdcmi);
     }
+    g_dcmi_crop_cwstrtr = DCMI->CWSTRTR;
+    g_dcmi_crop_cwsizer = DCMI->CWSIZER;
+    g_dcmi_crop_cr_after_enable = DCMI->CR;
     #else
     crop_status = HAL_DCMI_DisableCrop(&hdcmi);
     (void)crop_status;
@@ -648,7 +836,21 @@ static void start_snapshot(void)
      * the wait bounded so this remains soft-real-time: if sync is missed, start
      * anyway and let the timeout path recover.
      */
+#if DCMI_CROP_TEST_MODE || DCMI_PREARM_CAPTURE
+    /* Arm capture before the next frame instead of consuming a VSYNC event
+     * first. With PA4 fixed, the crop diagnostic proved this start strategy can
+     * fill a full crop; it also avoids starting just after the desired rows.
+     */
+    g_dcmi_sync_wait_status = DCMI_CROP_TEST_MODE ? 2U : 3U;
+    g_dcmi_sync_wait_ms = 0U;
+#if DCMI_CROP_TEST_MODE
+    g_dcmi_crop_test_start_mode = DCMI_MODE_CONTINUOUS;
+    g_dcmi_crop_test_strategy = 3U;
+    g_dcmi_crop_test_prearmed_count++;
+#endif
+#else
     g_dcmi_sync_wait_status = wait_for_frame_boundary();
+#endif
 
     #if DCMI_BOTTOM_TIMED_BAND
     if (active_crop_index == DCMI_EDGE_BOTTOM && next_bottom_band_start_ms > 0U) {
@@ -671,7 +873,11 @@ static void start_snapshot(void)
     #endif
 
     g_dcmi_start_status = HAL_DCMI_Start_DMA(&hdcmi,
+#if DCMI_CROP_TEST_MODE
                                              DCMI_MODE_CONTINUOUS,
+#else
+                                             DCMI_MODE_CONTINUOUS,
+#endif
                                              (uint32_t)dcmi_buffer,
                                              active_capture_words);
     last_restart_ms = HAL_GetTick();
@@ -689,7 +895,11 @@ static void start_snapshot(void)
         dcmi_status.state = DCMI_CAPTURE_RUNNING;
         g_dcmi_state = DCMI_CAPTURE_RUNNING;
         g_dcmi_restart_count++;
+#if DCMI_CROP_TEST_MODE
+        next_crop_index = DCMI_EDGE_TOP;
+#else
         next_crop_index = (next_crop_index + 1U) % DCMI_EDGE_COUNT;
+#endif
     } else {
         dcmi_status.errors++;
         g_dcmi_error_count = dcmi_status.errors;
@@ -700,6 +910,7 @@ static void start_snapshot(void)
 
 }
 
+#if !DCMI_CROP_TEST_MODE && !DCMI_PREARM_CAPTURE
 static uint32_t wait_for_frame_boundary(void)
 {
     uint32_t start_ms = HAL_GetTick();
@@ -731,6 +942,7 @@ static uint32_t wait_for_frame_boundary(void)
     __HAL_DCMI_DISABLE(&hdcmi);
     return 0U;
 }
+#endif
 
 static void analyze_buffer(void)
 {
@@ -767,7 +979,15 @@ static void analyze_buffer(void)
         previous = dcmi_buffer[0];
     }
 
+#if DCMI_SIDE_HORIZONTAL_BANDS
+    /* Horizontal side-band mode updates only a small slice each capture.
+     * Clear just the zones this crop can touch so previous good values for
+     * untouched LEDs stay live and the output can publish incrementally.
+     */
+    clear_current_capture_zones();
+#else
     begin_perimeter_cycle_if_needed();
+#endif
 
     for (uint32_t i = 0; i < words_to_analyze; i++) {
         uint32_t word = dcmi_buffer[i];
@@ -819,8 +1039,29 @@ static void analyze_buffer(void)
              * 16 x full-height edge rectangles and are divided by Y so every
              * side LED gets a nearby screen sample each side capture.
              */
-            if (DCMI_BOTTOM_TIMED_BAND != 0U &&
-                active_crop_index == DCMI_EDGE_RIGHT) {
+            if (DCMI_SIDE_HORIZONTAL_BANDS != 0U &&
+                (active_crop_index == DCMI_EDGE_RIGHT ||
+                 active_crop_index == DCMI_EDGE_LEFT)) {
+                uint32_t right_zone;
+                uint32_t left_zone;
+
+                side_band_zone_pair(&right_zone, &left_zone);
+
+                /* A 1280x16 side-band contains both screen sides. Use the
+                 * first 16 columns for the left edge and the last 16 columns
+                 * for the right edge, so one reliable crop updates both sides.
+                 */
+                if (pixel_x >= EDGE_BORDER_PIXELS) {
+                    if (pixel_x + EDGE_BORDER_PIXELS >= crop_width) {
+                        accumulate_led_zone_sample(right_zone, sample, red, green, blue);
+                    }
+                } else {
+                    accumulate_led_zone_sample(left_zone, sample, red, green, blue);
+                }
+
+                use_sample_for_led_zone = 0U;
+            } else if (DCMI_BOTTOM_TIMED_BAND != 0U &&
+                       active_crop_index == DCMI_EDGE_RIGHT) {
                 if (pixel_x + EDGE_BORDER_PIXELS < crop_width) {
                     use_sample_for_led_zone = 0U;
                 }
@@ -834,6 +1075,21 @@ static void analyze_buffer(void)
                 led_zone = DCMI_LEFT_ZONE_OFFSET +
                            (active_side_band_index % DCMI_LEFT_ZONE_COUNT);
             } else {
+                /* Wide vertical side crops are a DCMI reliability experiment:
+                 * capture 28 columns so the crop engine has a wider window,
+                 * then discard the inner 12 columns and color LEDs only from
+                 * the true outer 16-pixel screen edge.
+                 */
+                if (active_crop_index == DCMI_EDGE_RIGHT &&
+                    crop_width > EDGE_BORDER_PIXELS &&
+                    pixel_x + EDGE_BORDER_PIXELS < crop_width) {
+                    use_sample_for_led_zone = 0U;
+                } else if (active_crop_index == DCMI_EDGE_LEFT &&
+                           crop_width > EDGE_BORDER_PIXELS &&
+                           pixel_x >= EDGE_BORDER_PIXELS) {
+                    use_sample_for_led_zone = 0U;
+                }
+
                 led_zone = edge_zone_offset(active_crop_index) +
                            edge_local_zone(active_crop_index,
                                            pixel_x,
@@ -852,18 +1108,7 @@ static void analyze_buffer(void)
             zone_blue_sum[zone] += blue;
 
             if (use_sample_for_led_zone != 0U && led_zone < DCMI_LED_ZONE_COUNT) {
-                /* Favor vivid edge pixels over dark background pixels, while
-                 * still letting low-light scenes contribute. This gives each
-                 * LED a more "nearby object" color instead of a washed panel
-                 * average.
-                 */
-                uint32_t weight = rgb332_weight_lut[sample];
-
-                led_zone_red_sum[led_zone] += red * weight;
-                led_zone_green_sum[led_zone] += green * weight;
-                led_zone_blue_sum[led_zone] += blue * weight;
-                led_zone_weight_sum[led_zone] += weight;
-                led_zone_sample_count[led_zone]++;
+                accumulate_led_zone_sample(led_zone, sample, red, green, blue);
             }
 
             for (uint32_t bit = 0U; bit < 8U; bit++) {
@@ -977,9 +1222,13 @@ static void analyze_buffer(void)
         g_dcmi_zone3_b = zone_blue_sum[3] / zone_count[3];
     }
 
+#if DCMI_SIDE_HORIZONTAL_BANDS
+    finalize_incremental_capture();
+#else
     if (mark_current_perimeter_edge_done() != 0U) {
         finalize_perimeter_cycle();
     }
+#endif
 
 }
 
@@ -1021,35 +1270,6 @@ static uint32_t rescale_with_baseline(uint32_t value, uint32_t baseline)
     }
 
     return ((value - baseline) * 255U) / (255U - baseline);
-}
-
-static uint32_t zone_expected_in_current_capture(uint32_t zone)
-{
-    switch (active_crop_index) {
-    case DCMI_EDGE_TOP:
-        return zone >= DCMI_TOP_ZONE_OFFSET &&
-               zone < DCMI_LEFT_ZONE_OFFSET;
-    case DCMI_EDGE_BOTTOM:
-        return zone >= DCMI_BOTTOM_ZONE_OFFSET &&
-               zone < DCMI_LED_ZONE_COUNT;
-    case DCMI_EDGE_RIGHT:
-        if (DCMI_BOTTOM_TIMED_BAND == 0U) {
-            return zone < DCMI_TOP_ZONE_OFFSET;
-        }
-
-        return zone == (DCMI_RIGHT_ZONE_OFFSET +
-                        (active_side_band_index % DCMI_RIGHT_ZONE_COUNT));
-    case DCMI_EDGE_LEFT:
-        if (DCMI_BOTTOM_TIMED_BAND == 0U) {
-            return zone >= DCMI_LEFT_ZONE_OFFSET &&
-                   zone < DCMI_BOTTOM_ZONE_OFFSET;
-        }
-
-        return zone == (DCMI_LEFT_ZONE_OFFSET +
-                        (active_side_band_index % DCMI_LEFT_ZONE_COUNT));
-    default:
-        return 0U;
-    }
 }
 
 static uint32_t cartesian_y_to_dcmi_y(uint32_t cart_y, uint32_t height)
@@ -1143,8 +1363,61 @@ static uint32_t edge_local_zone(uint32_t edge, uint32_t x, uint32_t y,
     return local;
 }
 
+static void side_band_zone_pair(uint32_t *right_zone, uint32_t *left_zone)
+{
+    uint32_t right_index = active_side_band_index % DCMI_RIGHT_ZONE_COUNT;
+    uint32_t left_index = active_side_band_index % DCMI_LEFT_ZONE_COUNT;
+
+    if (active_crop_index == DCMI_EDGE_RIGHT) {
+        /* Right band index 0 is bottom. The current left-zone convention uses
+         * index 0 at top, so mirror the same physical Y position.
+         */
+        left_index = (DCMI_LEFT_ZONE_COUNT - 1U) -
+                     (active_side_band_index % DCMI_LEFT_ZONE_COUNT);
+    } else if (active_crop_index == DCMI_EDGE_LEFT) {
+        /* Kept for diagnostic fallback: a left-scheduled band mirrors into
+         * the corresponding right-side physical Y position.
+         */
+        right_index = (DCMI_RIGHT_ZONE_COUNT - 1U) -
+                      (active_side_band_index % DCMI_RIGHT_ZONE_COUNT);
+    }
+
+    *right_zone = DCMI_RIGHT_ZONE_OFFSET + right_index;
+    *left_zone = DCMI_LEFT_ZONE_OFFSET + left_index;
+}
+
+static void accumulate_led_zone_sample(uint32_t led_zone,
+                                       uint32_t sample,
+                                       uint32_t red,
+                                       uint32_t green,
+                                       uint32_t blue)
+{
+    uint32_t weight;
+
+    if (led_zone >= DCMI_LED_ZONE_COUNT) {
+        return;
+    }
+
+    /* Favor vivid edge pixels over dark background pixels, while still letting
+     * low-light scenes contribute. This gives each LED a nearby-object color
+     * instead of a washed panel average.
+     */
+    weight = rgb332_weight_lut[sample];
+    led_zone_red_sum[led_zone] += red * weight;
+    led_zone_green_sum[led_zone] += green * weight;
+    led_zone_blue_sum[led_zone] += blue * weight;
+    led_zone_weight_sum[led_zone] += weight;
+    led_zone_sample_count[led_zone]++;
+}
+
 static uint32_t capture_accept_words(void)
 {
+#if DCMI_CROP_TEST_MODE
+    /* The crop test is successful only if the complete 1280x16 rectangle
+     * reaches DMA. Do not hide under-fills behind responsive early accept.
+     */
+    return active_capture_words;
+#else
     uint32_t accept_words = DCMI_SIDE_EARLY_ACCEPT;
 
     /* Wide top/bottom crops give every horizontal LED zone useful data even
@@ -1162,10 +1435,14 @@ static uint32_t capture_accept_words(void)
     }
 
     return accept_words;
+#endif
 }
 
 static uint32_t capture_min_accept_words(void)
 {
+#if DCMI_CROP_TEST_MODE
+    return active_capture_words;
+#else
     uint32_t min_words = DCMI_TIMEOUT_ACCEPT_FLOOR_SIDE;
 
     if (active_crop_index == DCMI_EDGE_TOP ||
@@ -1178,8 +1455,35 @@ static uint32_t capture_min_accept_words(void)
     }
 
     return min_words;
+#endif
 }
 
+#if DCMI_SIDE_HORIZONTAL_BANDS
+static uint32_t side_band_cartesian_y(uint32_t edge, uint32_t band_index)
+{
+    uint32_t count = edge_zone_count(edge);
+    uint32_t max_y = VIDEO_ACTIVE_HEIGHT - EDGE_BORDER_PIXELS;
+    uint32_t divisor;
+
+    if (count <= 1U) {
+        return 0U;
+    }
+
+    if (band_index >= count) {
+        band_index = count - 1U;
+    }
+
+    divisor = count - 1U;
+
+    if (edge == DCMI_EDGE_LEFT) {
+        band_index = divisor - band_index;
+    }
+
+    return (band_index * max_y) / divisor;
+}
+#endif
+
+#if !DCMI_SIDE_HORIZONTAL_BANDS
 static void begin_perimeter_cycle_if_needed(void)
 {
     if (perimeter_edges_done_mask != 0U) {
@@ -1198,6 +1502,20 @@ static void begin_perimeter_cycle_if_needed(void)
 static uint32_t mark_current_perimeter_edge_done(void)
 {
     if (active_crop_index < DCMI_EDGE_COUNT) {
+#if DCMI_SIDE_HORIZONTAL_BANDS
+        if (active_crop_index == DCMI_EDGE_RIGHT ||
+            active_crop_index == DCMI_EDGE_LEFT) {
+            uint32_t count = edge_zone_count(active_crop_index);
+
+            if ((active_side_band_index + 1U) < count) {
+                return 0U;
+            }
+
+            perimeter_edges_done_mask |= (1UL << DCMI_EDGE_RIGHT);
+            perimeter_edges_done_mask |= (1UL << DCMI_EDGE_LEFT);
+            return perimeter_edges_done_mask == DCMI_PERIMETER_COMPLETE_MASK;
+        }
+#endif
         perimeter_edges_done_mask |= (1UL << active_crop_index);
     }
 
@@ -1209,6 +1527,7 @@ static uint32_t mark_current_perimeter_edge_done(void)
     perimeter_edges_done_mask = 0U;
     return 1U;
 }
+#endif
 
 static uint32_t blend_channel(uint32_t prev_value,
                               uint32_t raw_value,
@@ -1223,6 +1542,295 @@ static uint32_t blend_channel(uint32_t prev_value,
             (raw_value * alpha_num)) / alpha_den;
 }
 
+static void reset_zone_accumulator(uint32_t zone_index)
+{
+    if (zone_index >= DCMI_LED_ZONE_COUNT) {
+        return;
+    }
+
+    led_zone_red_sum[zone_index] = 0U;
+    led_zone_green_sum[zone_index] = 0U;
+    led_zone_blue_sum[zone_index] = 0U;
+    led_zone_weight_sum[zone_index] = 0U;
+    led_zone_sample_count[zone_index] = 0U;
+}
+
+static uint32_t apply_sampled_zone(uint32_t zone_index,
+                                   uint32_t *frame_delta_max,
+                                   uint32_t *frame_delta_sum,
+                                   uint32_t *frame_delta_count,
+                                   uint32_t *frame_spike_reject,
+                                   uint32_t *frame_low_trust_spike)
+{
+    uint32_t raw_r;
+    uint32_t raw_g;
+    uint32_t raw_b;
+    uint32_t prev_r;
+    uint32_t prev_g;
+    uint32_t prev_b;
+    uint32_t delta_r;
+    uint32_t delta_g;
+    uint32_t delta_b;
+    uint32_t color_delta;
+    uint32_t alpha_num = DCMI_SMOOTH_ALPHA_WEAK_NUM;
+    uint32_t alpha_den = DCMI_SMOOTH_ALPHA_WEAK_DEN;
+    uint32_t low_trust_zone;
+
+    if (zone_index >= DCMI_LED_ZONE_COUNT ||
+        led_zone_sample_count[zone_index] < DCMI_ZONE_MIN_SAMPLES ||
+        led_zone_weight_sum[zone_index] == 0U) {
+        return 0U;
+    }
+
+    raw_r = led_zone_red_sum[zone_index] / led_zone_weight_sum[zone_index];
+    raw_g = led_zone_green_sum[zone_index] / led_zone_weight_sum[zone_index];
+    raw_b = led_zone_blue_sum[zone_index] / led_zone_weight_sum[zone_index];
+    prev_r = smoothed_led_zone_r[zone_index];
+    prev_g = smoothed_led_zone_g[zone_index];
+    prev_b = smoothed_led_zone_b[zone_index];
+    delta_r = (raw_r > prev_r) ? (raw_r - prev_r) : (prev_r - raw_r);
+    delta_g = (raw_g > prev_g) ? (raw_g - prev_g) : (prev_g - raw_g);
+    delta_b = (raw_b > prev_b) ? (raw_b - prev_b) : (prev_b - raw_b);
+    color_delta = delta_r;
+
+    if (delta_g > color_delta) {
+        color_delta = delta_g;
+    }
+    if (delta_b > color_delta) {
+        color_delta = delta_b;
+    }
+
+    if (frame_delta_max != NULL && color_delta > *frame_delta_max) {
+        *frame_delta_max = color_delta;
+    }
+    if (frame_delta_sum != NULL) {
+        *frame_delta_sum += color_delta;
+    }
+    if (frame_delta_count != NULL) {
+        (*frame_delta_count)++;
+    }
+
+    low_trust_zone =
+        led_zone_sample_count[zone_index] < DCMI_ZONE_LOW_TRUST_SAMPLES ? 1U : 0U;
+
+    if (low_trust_zone != 0U &&
+        color_delta >= DCMI_ZONE_LOW_TRUST_SPIKE_DELTA) {
+        /* Too few samples plus a huge jump is usually transport noise. */
+        if (frame_spike_reject != NULL) {
+            (*frame_spike_reject)++;
+        }
+        if (frame_low_trust_spike != NULL) {
+            (*frame_low_trust_spike)++;
+        }
+        if (led_zone_missed_count[zone_index] < 0xFFFFFFFFU) {
+            led_zone_missed_count[zone_index]++;
+        }
+        return 0U;
+    }
+
+    if (low_trust_zone == 0U &&
+        color_delta >= DCMI_SMOOTH_SCENE_CUT_DELTA) {
+        alpha_num = DCMI_SMOOTH_ALPHA_STRONG_NUM;
+        alpha_den = DCMI_SMOOTH_ALPHA_STRONG_DEN;
+    } else if (color_delta <= DCMI_SMOOTH_DELTA_MED_MAX) {
+        if (color_delta > DCMI_SMOOTH_DELTA_STRONG_MAX) {
+            alpha_num = DCMI_SMOOTH_ALPHA_MED_NUM;
+            alpha_den = DCMI_SMOOTH_ALPHA_MED_DEN;
+        }
+    } else if (low_trust_zone == 0U) {
+        alpha_num = DCMI_SMOOTH_ALPHA_STRONG_NUM;
+        alpha_den = DCMI_SMOOTH_ALPHA_STRONG_DEN;
+    }
+
+    smoothed_led_zone_r[zone_index] =
+        blend_channel(smoothed_led_zone_r[zone_index], raw_r, alpha_num, alpha_den);
+    smoothed_led_zone_g[zone_index] =
+        blend_channel(smoothed_led_zone_g[zone_index], raw_g, alpha_num, alpha_den);
+    smoothed_led_zone_b[zone_index] =
+        blend_channel(smoothed_led_zone_b[zone_index], raw_b, alpha_num, alpha_den);
+
+    g_dcmi_led_zone_r[zone_index] = smoothed_led_zone_r[zone_index];
+    g_dcmi_led_zone_g[zone_index] = smoothed_led_zone_g[zone_index];
+    g_dcmi_led_zone_b[zone_index] = smoothed_led_zone_b[zone_index];
+    led_zone_missed_count[zone_index] = 0U;
+
+    if (led_zone_update_counter[zone_index] < 0xFFFFFFFFU) {
+        led_zone_update_counter[zone_index]++;
+    }
+
+    return 1U;
+}
+
+#if DCMI_SIDE_HORIZONTAL_BANDS
+static uint32_t zone_in_current_capture(uint32_t zone_index)
+{
+    uint32_t right_zone;
+    uint32_t left_zone;
+
+    if (zone_index >= DCMI_LED_ZONE_COUNT) {
+        return 0U;
+    }
+
+    if (active_crop_index == DCMI_EDGE_TOP) {
+        return (zone_index >= DCMI_TOP_ZONE_OFFSET &&
+                zone_index < DCMI_LEFT_ZONE_OFFSET) ? 1U : 0U;
+    }
+
+    if (active_crop_index == DCMI_EDGE_BOTTOM) {
+        return (zone_index >= DCMI_BOTTOM_ZONE_OFFSET &&
+                zone_index < DCMI_LED_ZONE_COUNT) ? 1U : 0U;
+    }
+
+    if (active_crop_index == DCMI_EDGE_RIGHT ||
+        active_crop_index == DCMI_EDGE_LEFT) {
+        side_band_zone_pair(&right_zone, &left_zone);
+        return (zone_index == right_zone || zone_index == left_zone) ? 1U : 0U;
+    }
+
+    return 0U;
+}
+
+static void clear_current_capture_zones(void)
+{
+    for (uint32_t zone_index = 0U; zone_index < DCMI_LED_ZONE_COUNT; zone_index++) {
+        if (zone_in_current_capture(zone_index) != 0U) {
+            reset_zone_accumulator(zone_index);
+        }
+    }
+}
+
+static void finalize_incremental_capture(void)
+{
+    uint32_t expected_zones = 0U;
+    uint32_t updated_zones = 0U;
+    uint32_t frame_delta_max = 0U;
+    uint32_t frame_delta_sum = 0U;
+    uint32_t frame_delta_count = 0U;
+    uint32_t frame_spike_reject = 0U;
+    uint32_t frame_low_trust_spike = 0U;
+    uint32_t top_good_zones = 0U;
+    uint32_t top_min_level = 0xFFFFFFFFU;
+    uint32_t top_max_level = 0U;
+    uint32_t top_raw_valid_zones = 0U;
+    uint32_t top_raw_min_level = 0xFFFFFFFFU;
+    uint32_t top_raw_max_level = 0U;
+
+    for (uint32_t zone_index = 0U; zone_index < DCMI_LED_ZONE_COUNT; zone_index++) {
+        if (zone_in_current_capture(zone_index) == 0U) {
+            continue;
+        }
+
+        expected_zones++;
+        updated_zones += apply_sampled_zone(zone_index,
+                                            &frame_delta_max,
+                                            &frame_delta_sum,
+                                            &frame_delta_count,
+                                            &frame_spike_reject,
+                                            &frame_low_trust_spike);
+    }
+
+    for (uint32_t zone_index = DCMI_TOP_ZONE_OFFSET;
+         zone_index < DCMI_LEFT_ZONE_OFFSET;
+         zone_index++) {
+        uint32_t level = g_dcmi_led_zone_r[zone_index];
+        uint32_t raw_r = 0U;
+        uint32_t raw_g = 0U;
+        uint32_t raw_b = 0U;
+        uint32_t raw_level = 0U;
+
+        if (g_dcmi_led_zone_g[zone_index] > level) {
+            level = g_dcmi_led_zone_g[zone_index];
+        }
+        if (g_dcmi_led_zone_b[zone_index] > level) {
+            level = g_dcmi_led_zone_b[zone_index];
+        }
+        if (level > 0U) {
+            top_good_zones++;
+        }
+        if (level < top_min_level) {
+            top_min_level = level;
+        }
+        if (level > top_max_level) {
+            top_max_level = level;
+        }
+
+        if (led_zone_sample_count[zone_index] >= DCMI_ZONE_MIN_SAMPLES &&
+            led_zone_weight_sum[zone_index] > 0U) {
+            raw_r = led_zone_red_sum[zone_index] / led_zone_weight_sum[zone_index];
+            raw_g = led_zone_green_sum[zone_index] / led_zone_weight_sum[zone_index];
+            raw_b = led_zone_blue_sum[zone_index] / led_zone_weight_sum[zone_index];
+            raw_level = raw_r;
+            if (raw_g > raw_level) {
+                raw_level = raw_g;
+            }
+            if (raw_b > raw_level) {
+                raw_level = raw_b;
+            }
+            if (raw_level < top_raw_min_level) {
+                top_raw_min_level = raw_level;
+            }
+            if (raw_level > top_raw_max_level) {
+                top_raw_max_level = raw_level;
+            }
+            top_raw_valid_zones++;
+        }
+
+        if (zone_index == DCMI_TOP_ZONE_OFFSET) {
+            g_dcmi_top_raw_first_r = raw_r;
+            g_dcmi_top_raw_first_g = raw_g;
+            g_dcmi_top_raw_first_b = raw_b;
+            g_dcmi_top_first_samples = led_zone_sample_count[zone_index];
+        } else if (zone_index == (DCMI_TOP_ZONE_OFFSET + (DCMI_TOP_ZONE_COUNT / 2U))) {
+            g_dcmi_top_raw_mid_r = raw_r;
+            g_dcmi_top_raw_mid_g = raw_g;
+            g_dcmi_top_raw_mid_b = raw_b;
+            g_dcmi_top_mid_samples = led_zone_sample_count[zone_index];
+        } else if (zone_index == (DCMI_LEFT_ZONE_OFFSET - 1U)) {
+            g_dcmi_top_raw_last_r = raw_r;
+            g_dcmi_top_raw_last_g = raw_g;
+            g_dcmi_top_raw_last_b = raw_b;
+            g_dcmi_top_last_samples = led_zone_sample_count[zone_index];
+        }
+    }
+
+    g_dcmi_zone_spike_reject_count += frame_spike_reject;
+    g_dcmi_zone_low_trust_spike_count += frame_low_trust_spike;
+    /* Incremental publishing preserves untouched zones instead of treating
+     * them as missed every mini-frame, so these legacy full-cycle counters
+     * intentionally do not change here.
+     */
+    g_dcmi_zone_miss_hold_count += 0U;
+    g_dcmi_zone_miss_decay_count += 0U;
+    g_dcmi_zone_color_delta_max = frame_delta_max;
+    g_dcmi_zone_color_delta_avg =
+        frame_delta_count > 0U ? (frame_delta_sum / frame_delta_count) : 0U;
+    g_dcmi_frame_quality_last =
+        expected_zones > 0U ? (updated_zones * 100U) / expected_zones : 0U;
+    g_dcmi_top_good_zones = top_good_zones;
+    g_dcmi_top_color_spread =
+        top_max_level >= top_min_level ? (top_max_level - top_min_level) : 0U;
+    g_dcmi_top_raw_color_spread =
+        top_raw_valid_zones > 0U ? (top_raw_max_level - top_raw_min_level) : 0U;
+    g_dcmi_top_first_r = g_dcmi_led_zone_r[DCMI_TOP_ZONE_OFFSET];
+    g_dcmi_top_first_g = g_dcmi_led_zone_g[DCMI_TOP_ZONE_OFFSET];
+    g_dcmi_top_first_b = g_dcmi_led_zone_b[DCMI_TOP_ZONE_OFFSET];
+    g_dcmi_top_mid_r = g_dcmi_led_zone_r[DCMI_TOP_ZONE_OFFSET + (DCMI_TOP_ZONE_COUNT / 2U)];
+    g_dcmi_top_mid_g = g_dcmi_led_zone_g[DCMI_TOP_ZONE_OFFSET + (DCMI_TOP_ZONE_COUNT / 2U)];
+    g_dcmi_top_mid_b = g_dcmi_led_zone_b[DCMI_TOP_ZONE_OFFSET + (DCMI_TOP_ZONE_COUNT / 2U)];
+    g_dcmi_top_last_r = g_dcmi_led_zone_r[DCMI_LEFT_ZONE_OFFSET - 1U];
+    g_dcmi_top_last_g = g_dcmi_led_zone_g[DCMI_LEFT_ZONE_OFFSET - 1U];
+    g_dcmi_top_last_b = g_dcmi_led_zone_b[DCMI_LEFT_ZONE_OFFSET - 1U];
+
+    g_dcmi_zone_update_count++;
+    if (updated_zones > 0U) {
+        g_dcmi_led_update_pending = 1U;
+    } else {
+        g_dcmi_frame_publish_skip_count++;
+    }
+}
+#endif
+
+#if !DCMI_SIDE_HORIZONTAL_BANDS
 static void finalize_perimeter_cycle(void)
 {
     uint32_t frame_good_zones = 0U;
@@ -1384,21 +1992,7 @@ static void finalize_perimeter_cycle(void)
         g_dcmi_frame_publish_skip_count++;
     }
 }
-
-
-static void clear_current_capture_zones(void)
-{
-    for (uint32_t zone = 0U; zone < DCMI_LED_ZONE_COUNT; zone++) {
-        if (zone_expected_in_current_capture(zone) != 0U) {
-            led_zone_red_sum[zone] = 0U;
-            led_zone_green_sum[zone] = 0U;
-            led_zone_blue_sum[zone] = 0U;
-            led_zone_weight_sum[zone] = 0U;
-            led_zone_sample_count[zone] = 0U;
-        }
-    }
-}
-
+#endif
 
 static void mark_crop_accept(uint32_t early_accept)
 {
@@ -1409,7 +2003,22 @@ static void mark_crop_accept(uint32_t early_accept)
     if (active_crop_index < DCMI_EDGE_COUNT) {
         g_dcmi_edge_success_count[active_crop_index]++;
         g_dcmi_edge_last_words[active_crop_index] = active_captured_words;
+#if DCMI_SIDE_HORIZONTAL_BANDS
+        if (active_crop_index == DCMI_EDGE_RIGHT) {
+            g_dcmi_edge_success_count[DCMI_EDGE_LEFT]++;
+            g_dcmi_edge_last_words[DCMI_EDGE_LEFT] = active_captured_words;
+        } else if (active_crop_index == DCMI_EDGE_LEFT) {
+            g_dcmi_edge_success_count[DCMI_EDGE_RIGHT]++;
+            g_dcmi_edge_last_words[DCMI_EDGE_RIGHT] = active_captured_words;
+        }
+#endif
     }
+
+    record_side_band_words(active_captured_words);
+
+#if DCMI_SIDE_HORIZONTAL_BANDS
+    advance_side_band_index();
+#endif
 
     #if DCMI_BOTTOM_TIMED_BAND
     switch (active_crop_index) {
@@ -1432,32 +2041,100 @@ static void mark_crop_accept(uint32_t early_accept)
 static void mark_crop_zero(void)
 {
     g_dcmi_zero_frame_count++;
-    begin_perimeter_cycle_if_needed();
-    clear_current_capture_zones();
 
     if (active_crop_index < DCMI_EDGE_COUNT) {
         g_dcmi_edge_zero_count[active_crop_index]++;
         g_dcmi_edge_last_words[active_crop_index] = active_captured_words;
+#if DCMI_SIDE_HORIZONTAL_BANDS
+        if (active_crop_index == DCMI_EDGE_RIGHT) {
+            g_dcmi_edge_zero_count[DCMI_EDGE_LEFT]++;
+            g_dcmi_edge_last_words[DCMI_EDGE_LEFT] = active_captured_words;
+        } else if (active_crop_index == DCMI_EDGE_LEFT) {
+            g_dcmi_edge_zero_count[DCMI_EDGE_RIGHT]++;
+            g_dcmi_edge_last_words[DCMI_EDGE_RIGHT] = active_captured_words;
+        }
+#endif
     }
 
-    #if DCMI_BOTTOM_TIMED_BAND
+    record_side_band_words(active_captured_words);
+
+    /* A zero/underfilled capture is a transport miss, not black screen data.
+     * Preserve the last good LED values, but do not wedge the perimeter scanner
+     * on one flaky crop/band. The next capture should keep walking so other LEDs
+     * remain responsive while this band gets another chance on the next pass.
+     */
+#if DCMI_SIDE_HORIZONTAL_BANDS
+    advance_side_band_index();
+#endif
+}
+
+static void advance_side_band_index(void)
+{
+#if DCMI_SIDE_HORIZONTAL_BANDS
     switch (active_crop_index) {
     case DCMI_EDGE_RIGHT:
         next_right_band_index = (active_side_band_index + 1U) % DCMI_RIGHT_ZONE_COUNT;
         g_dcmi_right_band_index = next_right_band_index;
-        break;
-    case DCMI_EDGE_BOTTOM:
+        next_left_band_index = (DCMI_LEFT_ZONE_COUNT - 1U) -
+                               (next_right_band_index % DCMI_LEFT_ZONE_COUNT);
+        g_dcmi_left_band_index = next_left_band_index;
         break;
     case DCMI_EDGE_LEFT:
         next_left_band_index = (active_side_band_index + 1U) % DCMI_LEFT_ZONE_COUNT;
         g_dcmi_left_band_index = next_left_band_index;
+        next_right_band_index = (DCMI_RIGHT_ZONE_COUNT - 1U) -
+                                (next_left_band_index % DCMI_RIGHT_ZONE_COUNT);
+        g_dcmi_right_band_index = next_right_band_index;
         break;
     default:
         break;
     }
-    #endif
+#else
+    (void)active_side_band_index;
+#endif
+}
 
-    if (mark_current_perimeter_edge_done() != 0U) {
-        finalize_perimeter_cycle();
+static void record_side_band_words(uint32_t words)
+{
+    if (DCMI_SIDE_HORIZONTAL_BANDS != 0U &&
+        (active_crop_index == DCMI_EDGE_RIGHT ||
+         active_crop_index == DCMI_EDGE_LEFT)) {
+        uint32_t right_zone;
+        uint32_t left_zone;
+        uint32_t right_index;
+        uint32_t left_index;
+
+        side_band_zone_pair(&right_zone, &left_zone);
+        right_index = right_zone - DCMI_RIGHT_ZONE_OFFSET;
+        left_index = left_zone - DCMI_LEFT_ZONE_OFFSET;
+
+        if (right_index < DCMI_RIGHT_ZONE_COUNT) {
+            g_dcmi_right_band_last_words[right_index] = words;
+            if (words > g_dcmi_right_band_max_words[right_index]) {
+                g_dcmi_right_band_max_words[right_index] = words;
+            }
+        }
+
+        if (left_index < DCMI_LEFT_ZONE_COUNT) {
+            g_dcmi_left_band_last_words[left_index] = words;
+            if (words > g_dcmi_left_band_max_words[left_index]) {
+                g_dcmi_left_band_max_words[left_index] = words;
+            }
+        }
+        return;
+    }
+
+    if (active_crop_index == DCMI_EDGE_RIGHT &&
+        active_side_band_index < DCMI_RIGHT_ZONE_COUNT) {
+        g_dcmi_right_band_last_words[active_side_band_index] = words;
+        if (words > g_dcmi_right_band_max_words[active_side_band_index]) {
+            g_dcmi_right_band_max_words[active_side_band_index] = words;
+        }
+    } else if (active_crop_index == DCMI_EDGE_LEFT &&
+               active_side_band_index < DCMI_LEFT_ZONE_COUNT) {
+        g_dcmi_left_band_last_words[active_side_band_index] = words;
+        if (words > g_dcmi_left_band_max_words[active_side_band_index]) {
+            g_dcmi_left_band_max_words[active_side_band_index] = words;
+        }
     }
 }
