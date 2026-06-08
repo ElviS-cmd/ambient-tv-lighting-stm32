@@ -52,5 +52,8 @@ showing full-screen red, green, blue, white, and black.
 - PA4 and PA6 were tested and are usable for DCMI on this STM32F407 Discovery board.
 - The RGB332 mapping is a first color milestone. If color banding is too visible,
   the upgrade path is a wider DCMI mode such as RGB444.
-- Current firmware drives the mounted 136 LEDs as one software zone per active
-  LED. The earlier LEDs on the 300 LED strip are intentionally left off.
+- The processing pipeline maintains 136 logical perimeter zones and maps them
+  to 135 physical LEDs. The left edge is resampled from 25 logical zones to
+  24 installed LEDs.
+- The WS2812 data signal is driven through an SN74AHCT125 level shifter. See
+  [hardware_wiring.md](hardware_wiring.md) for the output and power wiring.
