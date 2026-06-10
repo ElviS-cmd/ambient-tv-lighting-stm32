@@ -15,7 +15,12 @@
     ((DCMI_EDGE_TOP_BOTTOM_SAMPLES > DCMI_EDGE_SIDE_SAMPLES) ? \
       DCMI_EDGE_TOP_BOTTOM_SAMPLES : DCMI_EDGE_SIDE_SAMPLES)
 #define DCMI_CAPTURE_MAX_WORDS (DCMI_CAPTURE_MAX_SAMPLES / 4U)
-#define DCMI_RESTART_DELAY_MS 1U
+/* Re-arm the next crop immediately after a good capture; the source frame
+ * cadence is the natural pacing. Back off briefly only after errors so a
+ * persistent fault (no video, HAL busy) cannot spin the restart path hot.
+ */
+#define DCMI_RESTART_DELAY_MS 0U
+#define DCMI_ERROR_RESTART_BACKOFF_MS 2U
 #define DCMI_CAPTURE_TIMEOUT_MS 50U
 /* Large edge crops need enough samples to cover the full LED geometry.
  * With 1280x720:
@@ -64,15 +69,39 @@
  * row while validating that the rest of the vertical crop is aligned.
  */
 #define DCMI_FULL_HEIGHT_SIDE_TEST_MAX_MISSING_WORDS 7U
-#if DCMI_FULL_HEIGHT_SIDE_TEST_MODE
+/* Production side-edge strategy (used when the transport test mode is off):
+ * 1 = capture each side as one full-height vertical crop (28x720). All 25
+ *     side zones refresh every 4-capture perimeter cycle (~70-100 ms)
+ *     instead of one zone pair per 3-capture cycle (~1.2-1.5 s worst case).
+ *     Enable only after the side transport test reports reliable full-height
+ *     fills on the installed source (g_dcmi_side_test_full_count dominating).
+ * 0 = proven fallback: 1280x16 horizontal side bands, one zone pair per
+ *     capture. The TFP401/DCMI path fills short bands reliably; full-height
+ *     side crops can cross VSYNC and drop to zero words on some sources.
+ */
+#define DCMI_SIDE_VERTICAL_CROPS 1U
+#if DCMI_FULL_HEIGHT_SIDE_TEST_MODE || DCMI_SIDE_VERTICAL_CROPS
 #define DCMI_SIDE_HORIZONTAL_BANDS 0U
 #else
 #define DCMI_SIDE_HORIZONTAL_BANDS 1U
 #endif
-/* Side edges use reliable 1280x16 horizontal bands instead of tall/narrow
- * vertical crops. The TFP401/DCMI path fills short bands reliably; full-height
- * side crops can cross VSYNC and drop to zero words.
+/* Incremental publishing: each accepted capture clears, re-derives and
+ * publishes only the zones its crop touches, so untouched edges keep their
+ * last good colors. Both production side strategies use it. The transport
+ * test mode keeps the legacy whole-perimeter path, which by design never
+ * publishes LED updates.
  */
+#if DCMI_FULL_HEIGHT_SIDE_TEST_MODE
+#define DCMI_INCREMENTAL_PUBLISH 0U
+#else
+#define DCMI_INCREMENTAL_PUBLISH 1U
+#endif
+/* A partially filled vertical side crop leaves its lower rows - and their
+ * LED zones - unsampled, so sides must deliver the (nearly) complete
+ * rectangle. 140 words is 20 missing 28-pixel rows, well under one zone's
+ * 29-row span, so at worst the bottom zone is slightly under-sampled.
+ */
+#define DCMI_SIDE_VERTICAL_TIMEOUT_MISSING_WORDS 140U
 #define DCMI_BOTTOM_TIMED_BAND 0U
 #define DCMI_BOTTOM_START_DELAY_MS 8U
 /* Adaptive temporal smoothing. alpha is the fraction of the new raw value:
@@ -86,10 +115,26 @@
 #define DCMI_SMOOTH_ALPHA_MED_DEN 2U
 #define DCMI_SMOOTH_ALPHA_STRONG_NUM 3U
 #define DCMI_SMOOTH_ALPHA_STRONG_DEN 4U
+/* Snap alpha: take the raw value outright. Used for per-zone scene cuts and
+ * capture-wide scene changes, where easing toward the new color only reads
+ * as lag.
+ */
+#define DCMI_SMOOTH_ALPHA_SNAP_NUM 1U
+#define DCMI_SMOOTH_ALPHA_SNAP_DEN 1U
 /* Delta thresholds for selecting smoothing strength (0..255 channel scale). */
 #define DCMI_SMOOTH_DELTA_STRONG_MAX 8U
 #define DCMI_SMOOTH_DELTA_MED_MAX 32U
 #define DCMI_SMOOTH_SCENE_CUT_DELTA 96U
+/* Capture-wide scene change: when at least GLOBAL_CUT_NUM/GLOBAL_CUT_DEN of
+ * the zones sampled by one capture move past the medium delta, treat the
+ * whole capture as a cut - snap every sampled zone to its raw color and skip
+ * per-zone spike rejection, since a coherent jump across many zones is real
+ * content, not transport noise. Needs a minimum population so a 2-zone side
+ * band cannot trigger it.
+ */
+#define DCMI_GLOBAL_CUT_MIN_ZONES 8U
+#define DCMI_GLOBAL_CUT_NUM 1U
+#define DCMI_GLOBAL_CUT_DEN 3U
 /* Zones with very few samples are noisy; suppress large jumps there. */
 #define DCMI_ZONE_LOW_TRUST_SAMPLES 10U
 #define DCMI_ZONE_LOW_TRUST_SPIKE_DELTA 140U
@@ -340,6 +385,7 @@ static volatile uint32_t g_dcmi_observed_baseline_b;                   /* Observ
 /* Zone response rate tracking */
 static volatile uint32_t g_dcmi_zone_spike_reject_count;
 static volatile uint32_t g_dcmi_zone_low_trust_spike_count;
+static volatile uint32_t g_dcmi_global_cut_count;
 static volatile uint32_t g_dcmi_zone_miss_hold_count;
 static volatile uint32_t g_dcmi_zone_miss_decay_count;
 static volatile uint32_t g_dcmi_frame_publish_skip_count;
@@ -357,7 +403,7 @@ static volatile uint32_t g_dcmi_top_mid_b;
 static volatile uint32_t g_dcmi_top_last_r;
 static volatile uint32_t g_dcmi_top_last_g;
 static volatile uint32_t g_dcmi_top_last_b;
-#if DCMI_SIDE_HORIZONTAL_BANDS
+#if DCMI_INCREMENTAL_PUBLISH
 static volatile uint32_t g_dcmi_top_raw_color_spread;
 static volatile uint32_t g_dcmi_top_raw_first_r;
 static volatile uint32_t g_dcmi_top_raw_first_g;
@@ -415,7 +461,7 @@ static uint32_t next_left_band_index;
 static uint32_t next_side_band_start_ms = 0U;
 static uint32_t next_bottom_band_start_ms = 0U;
 #endif
-#if !DCMI_SIDE_HORIZONTAL_BANDS
+#if !DCMI_INCREMENTAL_PUBLISH
 static uint32_t perimeter_edges_done_mask;
 #endif
 static volatile uint32_t active_captured_words;
@@ -469,7 +515,7 @@ static uint32_t capture_min_accept_words(void);
 #if DCMI_SIDE_HORIZONTAL_BANDS
 static uint32_t side_band_cartesian_y(uint32_t edge, uint32_t band_index);
 #endif
-#if !DCMI_SIDE_HORIZONTAL_BANDS
+#if !DCMI_INCREMENTAL_PUBLISH
 static void begin_perimeter_cycle_if_needed(void);
 static uint32_t mark_current_perimeter_edge_done(void);
 #endif
@@ -477,9 +523,10 @@ static uint32_t blend_channel(uint32_t prev_value,
                               uint32_t raw_value,
                               uint32_t alpha_num,
                               uint32_t alpha_den);
-#if DCMI_SIDE_HORIZONTAL_BANDS
+#if DCMI_INCREMENTAL_PUBLISH
 static void reset_zone_accumulator(uint32_t zone_index);
 static uint32_t apply_sampled_zone(uint32_t zone_index,
+                                   uint32_t force_snap,
                                    uint32_t *frame_delta_max,
                                    uint32_t *frame_delta_sum,
                                    uint32_t *frame_delta_count,
@@ -489,7 +536,7 @@ static uint32_t zone_in_current_capture(uint32_t zone_index);
 static void clear_current_capture_zones(void);
 static void finalize_incremental_capture(void);
 #endif
-#if !DCMI_SIDE_HORIZONTAL_BANDS
+#if !DCMI_INCREMENTAL_PUBLISH
 static void finalize_perimeter_cycle(void);
 #endif
 static void mark_crop_accept(uint32_t early_accept);
@@ -665,8 +712,14 @@ void DCMI_Capture_Task(void)
         return;
     }
 
-    if ((HAL_GetTick() - last_restart_ms) >= DCMI_RESTART_DELAY_MS) {
-        start_snapshot();
+    {
+        uint32_t restart_delay_ms =
+            dcmi_status.state == DCMI_CAPTURE_ERROR ?
+            DCMI_ERROR_RESTART_BACKOFF_MS : DCMI_RESTART_DELAY_MS;
+
+        if ((HAL_GetTick() - last_restart_ms) >= restart_delay_ms) {
+            start_snapshot();
+        }
     }
 }
 
@@ -1071,7 +1124,7 @@ static void analyze_buffer(void)
     analyze_full_height_side_rows();
 #endif
 
-#if DCMI_SIDE_HORIZONTAL_BANDS
+#if DCMI_INCREMENTAL_PUBLISH
     /* Horizontal side-band mode updates only a small slice each capture.
      * Clear just the zones this crop can touch so previous good values for
      * untouched LEDs stay live and the output can publish incrementally.
@@ -1135,7 +1188,7 @@ static void analyze_buffer(void)
     analyze_buffer_diagnostics(words_to_analyze);
 #endif
 
-#if DCMI_SIDE_HORIZONTAL_BANDS
+#if DCMI_INCREMENTAL_PUBLISH
     finalize_incremental_capture();
 #else
     if (mark_current_perimeter_edge_done() != 0U) {
@@ -1615,12 +1668,19 @@ static uint32_t capture_accept_words(void)
      */
     return active_capture_words;
 #else
+#if DCMI_SIDE_HORIZONTAL_BANDS
     uint32_t accept_words = DCMI_SIDE_EARLY_ACCEPT;
+#else
+    /* Vertical side crops must cover every row or the lower zones starve;
+     * no early acceptance for sides.
+     */
+    uint32_t accept_words = active_capture_words;
+#endif
 
     /* Wide top/bottom crops give every horizontal LED zone useful data even
      * from a partial band: 1000 words = 4000 pixels, roughly 90 samples per
-     * 43-zone edge. Keep a lower early-accept threshold here than on timed
-     * side bands, where each capture feeds one vertical LED zone.
+     * 43-zone edge. Keep a lower early-accept threshold here than on side
+     * crops, where coverage depends on completing the rectangle.
      */
     if (active_crop_index == DCMI_EDGE_TOP ||
         active_crop_index == DCMI_EDGE_BOTTOM) {
@@ -1645,7 +1705,14 @@ static uint32_t capture_min_accept_words(void)
     }
     return active_capture_words;
 #else
+#if DCMI_SIDE_HORIZONTAL_BANDS
     uint32_t min_words = DCMI_TIMEOUT_ACCEPT_FLOOR_SIDE;
+#else
+    uint32_t min_words =
+        active_capture_words > DCMI_SIDE_VERTICAL_TIMEOUT_MISSING_WORDS ?
+        active_capture_words - DCMI_SIDE_VERTICAL_TIMEOUT_MISSING_WORDS :
+        active_capture_words;
+#endif
 
     if (active_crop_index == DCMI_EDGE_TOP ||
         active_crop_index == DCMI_EDGE_BOTTOM) {
@@ -1685,7 +1752,7 @@ static uint32_t side_band_cartesian_y(uint32_t edge, uint32_t band_index)
 }
 #endif
 
-#if !DCMI_SIDE_HORIZONTAL_BANDS
+#if !DCMI_INCREMENTAL_PUBLISH
 static void begin_perimeter_cycle_if_needed(void)
 {
     if (perimeter_edges_done_mask != 0U) {
@@ -1744,7 +1811,7 @@ static uint32_t blend_channel(uint32_t prev_value,
             (raw_value * alpha_num)) / alpha_den;
 }
 
-#if DCMI_SIDE_HORIZONTAL_BANDS
+#if DCMI_INCREMENTAL_PUBLISH
 static void reset_zone_accumulator(uint32_t zone_index)
 {
     if (zone_index >= DCMI_LED_ZONE_COUNT) {
@@ -1759,6 +1826,7 @@ static void reset_zone_accumulator(uint32_t zone_index)
 }
 
 static uint32_t apply_sampled_zone(uint32_t zone_index,
+                                   uint32_t force_snap,
                                    uint32_t *frame_delta_max,
                                    uint32_t *frame_delta_sum,
                                    uint32_t *frame_delta_count,
@@ -1816,7 +1884,8 @@ static uint32_t apply_sampled_zone(uint32_t zone_index,
     low_trust_zone =
         led_zone_sample_count[zone_index] < DCMI_ZONE_LOW_TRUST_SAMPLES ? 1U : 0U;
 
-    if (low_trust_zone != 0U &&
+    if (force_snap == 0U &&
+        low_trust_zone != 0U &&
         color_delta >= DCMI_ZONE_LOW_TRUST_SPIKE_DELTA) {
         /* Too few samples plus a huge jump is usually transport noise. */
         if (frame_spike_reject != NULL) {
@@ -1831,10 +1900,12 @@ static uint32_t apply_sampled_zone(uint32_t zone_index,
         return 0U;
     }
 
-    if (low_trust_zone == 0U &&
-        color_delta >= DCMI_SMOOTH_SCENE_CUT_DELTA) {
-        alpha_num = DCMI_SMOOTH_ALPHA_STRONG_NUM;
-        alpha_den = DCMI_SMOOTH_ALPHA_STRONG_DEN;
+    if (force_snap != 0U ||
+        (low_trust_zone == 0U &&
+         color_delta >= DCMI_SMOOTH_SCENE_CUT_DELTA)) {
+        /* Trusted cuts take the raw color outright; easing in reads as lag. */
+        alpha_num = DCMI_SMOOTH_ALPHA_SNAP_NUM;
+        alpha_den = DCMI_SMOOTH_ALPHA_SNAP_DEN;
     } else if (color_delta <= DCMI_SMOOTH_DELTA_MED_MAX) {
         if (color_delta > DCMI_SMOOTH_DELTA_STRONG_MAX) {
             alpha_num = DCMI_SMOOTH_ALPHA_MED_NUM;
@@ -1866,9 +1937,6 @@ static uint32_t apply_sampled_zone(uint32_t zone_index,
 
 static uint32_t zone_in_current_capture(uint32_t zone_index)
 {
-    uint32_t right_zone;
-    uint32_t left_zone;
-
     if (zone_index >= DCMI_LED_ZONE_COUNT) {
         return 0U;
     }
@@ -1883,11 +1951,28 @@ static uint32_t zone_in_current_capture(uint32_t zone_index)
                 zone_index < DCMI_LED_ZONE_COUNT) ? 1U : 0U;
     }
 
+#if DCMI_SIDE_HORIZONTAL_BANDS
     if (active_crop_index == DCMI_EDGE_RIGHT ||
         active_crop_index == DCMI_EDGE_LEFT) {
+        uint32_t right_zone;
+        uint32_t left_zone;
+
         side_band_zone_pair(&right_zone, &left_zone);
         return (zone_index == right_zone || zone_index == left_zone) ? 1U : 0U;
     }
+#else
+    /* Vertical side crops sample the full edge, so every zone on that side
+     * belongs to this capture.
+     */
+    if (active_crop_index == DCMI_EDGE_RIGHT) {
+        return (zone_index >= DCMI_RIGHT_ZONE_OFFSET &&
+                zone_index < DCMI_RIGHT_ZONE_OFFSET + DCMI_RIGHT_ZONE_COUNT) ? 1U : 0U;
+    }
+    if (active_crop_index == DCMI_EDGE_LEFT) {
+        return (zone_index >= DCMI_LEFT_ZONE_OFFSET &&
+                zone_index < DCMI_LEFT_ZONE_OFFSET + DCMI_LEFT_ZONE_COUNT) ? 1U : 0U;
+    }
+#endif
 
     return 0U;
 }
@@ -1905,6 +1990,7 @@ static void finalize_incremental_capture(void)
 {
     uint32_t expected_zones = 0U;
     uint32_t updated_zones = 0U;
+    uint32_t force_snap = 0U;
     uint32_t frame_delta_max = 0U;
     uint32_t frame_delta_sum = 0U;
     uint32_t frame_delta_count = 0U;
@@ -1917,6 +2003,61 @@ static void finalize_incremental_capture(void)
     uint32_t top_raw_min_level = 0xFFFFFFFFU;
     uint32_t top_raw_max_level = 0U;
 
+    /* Pass 1: measure how much of this capture moved. A coherent jump across
+     * a third of the sampled zones is a real scene change (cut, explosion,
+     * lightsaber sweep), so pass 2 snaps instead of easing and skips the
+     * per-zone spike rejection that would otherwise eat it.
+     */
+    {
+        uint32_t candidate_zones = 0U;
+        uint32_t big_delta_zones = 0U;
+
+        for (uint32_t zone_index = 0U; zone_index < DCMI_LED_ZONE_COUNT; zone_index++) {
+            uint32_t raw_r;
+            uint32_t raw_g;
+            uint32_t raw_b;
+            uint32_t delta;
+            uint32_t channel_delta;
+
+            if (zone_in_current_capture(zone_index) == 0U ||
+                led_zone_sample_count[zone_index] < DCMI_ZONE_MIN_SAMPLES ||
+                led_zone_weight_sum[zone_index] == 0U) {
+                continue;
+            }
+
+            raw_r = led_zone_red_sum[zone_index] / led_zone_weight_sum[zone_index];
+            raw_g = led_zone_green_sum[zone_index] / led_zone_weight_sum[zone_index];
+            raw_b = led_zone_blue_sum[zone_index] / led_zone_weight_sum[zone_index];
+            delta = (raw_r > smoothed_led_zone_r[zone_index]) ?
+                    (raw_r - smoothed_led_zone_r[zone_index]) :
+                    (smoothed_led_zone_r[zone_index] - raw_r);
+            channel_delta = (raw_g > smoothed_led_zone_g[zone_index]) ?
+                            (raw_g - smoothed_led_zone_g[zone_index]) :
+                            (smoothed_led_zone_g[zone_index] - raw_g);
+            if (channel_delta > delta) {
+                delta = channel_delta;
+            }
+            channel_delta = (raw_b > smoothed_led_zone_b[zone_index]) ?
+                            (raw_b - smoothed_led_zone_b[zone_index]) :
+                            (smoothed_led_zone_b[zone_index] - raw_b);
+            if (channel_delta > delta) {
+                delta = channel_delta;
+            }
+
+            candidate_zones++;
+            if (delta > DCMI_SMOOTH_DELTA_MED_MAX) {
+                big_delta_zones++;
+            }
+        }
+
+        if (candidate_zones >= DCMI_GLOBAL_CUT_MIN_ZONES &&
+            big_delta_zones * DCMI_GLOBAL_CUT_DEN >=
+            candidate_zones * DCMI_GLOBAL_CUT_NUM) {
+            force_snap = 1U;
+            g_dcmi_global_cut_count++;
+        }
+    }
+
     for (uint32_t zone_index = 0U; zone_index < DCMI_LED_ZONE_COUNT; zone_index++) {
         if (zone_in_current_capture(zone_index) == 0U) {
             continue;
@@ -1924,6 +2065,7 @@ static void finalize_incremental_capture(void)
 
         expected_zones++;
         updated_zones += apply_sampled_zone(zone_index,
+                                            force_snap,
                                             &frame_delta_max,
                                             &frame_delta_sum,
                                             &frame_delta_count,
@@ -2032,7 +2174,7 @@ static void finalize_incremental_capture(void)
 }
 #endif
 
-#if !DCMI_SIDE_HORIZONTAL_BANDS
+#if !DCMI_INCREMENTAL_PUBLISH
 static void finalize_perimeter_cycle(void)
 {
     uint32_t frame_good_zones = 0U;
@@ -2092,9 +2234,9 @@ static void finalize_perimeter_cycle(void)
 
             if (low_trust_zone == 0U &&
                 color_delta >= DCMI_SMOOTH_SCENE_CUT_DELTA) {
-                /* Trusted scene cuts should react fast. */
-                alpha_num = DCMI_SMOOTH_ALPHA_STRONG_NUM;
-                alpha_den = DCMI_SMOOTH_ALPHA_STRONG_DEN;
+                /* Trusted scene cuts take the raw color outright. */
+                alpha_num = DCMI_SMOOTH_ALPHA_SNAP_NUM;
+                alpha_den = DCMI_SMOOTH_ALPHA_SNAP_DEN;
             } else if (color_delta <= DCMI_SMOOTH_DELTA_MED_MAX) {
                 if (color_delta > DCMI_SMOOTH_DELTA_STRONG_MAX) {
                     alpha_num = DCMI_SMOOTH_ALPHA_MED_NUM;
