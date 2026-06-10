@@ -33,7 +33,19 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* Temporary bench tool: turn this Discovery board into a programmer for the
+ * TFP401 breakout's EDID EEPROM (the square SDA/SCL/GND/+5V pads next to its
+ * HDMI port). Set to 1, flash, follow the LED/Live-Expressions flow in
+ * edid_writer_run(), then set back to 0 and reflash the ambilight firmware.
+ *
+ * Wiring (TFP401 disconnected from HDMI and USB while programming):
+ *   breakout +5V pad -> Discovery 3V   (EEPROM runs fine at 3.3 V and this
+ *                                       keeps the I2C levels at 3.3 V)
+ *   breakout GND pad -> Discovery GND
+ *   breakout SCL pad -> PB8
+ *   breakout SDA pad -> PB9
+ */
+#define EDID_WRITER_MODE 1U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -65,6 +77,245 @@ static void MX_TIM2_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+#if EDID_WRITER_MODE
+/* Bit-banged I2C master (~25 kHz, open-drain with internal pull-ups) for the
+ * 24C02-class EDID EEPROM at address 0x50 on the TFP401 breakout's pads.
+ *
+ * Flow, watched through Live Expressions:
+ *   boot  -> reads all 256 EEPROM bytes into g_edid_dump
+ *            g_edid_state = 2 (armed), blue LED blinking
+ *            (stock content starts 00 FF .. FF 00 04 81 04 00)
+ *   press the blue USER button -> writes the AMBILIGHT EDID (orange LED),
+ *            pads bytes 128..255 with 0xFF, then verifies byte-for-byte
+ *   green LED blinking = written + verified (g_edid_state = 5)
+ *   red LED blinking   = failure; g_edid_state/g_edid_fail_offset say where
+ */
+#define EDID_EE_ADDR 0x50U
+
+static const uint8_t edid_image[128] = {
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x04, 0x81, 0x20, 0x07, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x24, 0x01, 0x03, 0x80, 0x0F, 0x0A, 0x78, 0x02, 0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26,
+    0x0F, 0x50, 0x54, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0xB4, 0x14, 0x00, 0xA0, 0x50, 0xD0, 0x11, 0x20, 0x30, 0x20,
+    0x35, 0x00, 0x6C, 0x44, 0x00, 0x00, 0x00, 0x1A, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x41, 0x4D, 0x42,
+    0x49, 0x4C, 0x49, 0x47, 0x48, 0x54, 0x0A, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xFD, 0x00, 0x17,
+    0x4C, 0x1E, 0x2E, 0x06, 0x0A, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x10,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2E
+};
+
+/* 0=init 1=eeprom-no-ack 2=armed 3=writing 4=verifying 5=OK
+ * 6=write-nack 7=verify-mismatch */
+volatile uint32_t g_edid_state;
+volatile uint32_t g_edid_fail_offset = 0xFFFFFFFFU;
+volatile uint8_t g_edid_dump[256];
+
+static void ew_delay(void)
+{
+    for (volatile uint32_t i = 0U; i < 400U; i++) {
+        __NOP();
+    }
+}
+
+static void ew_scl(uint32_t level)
+{
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8,
+                      level != 0U ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void ew_sda(uint32_t level)
+{
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9,
+                      level != 0U ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static uint32_t ew_sda_read(void)
+{
+    return HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == GPIO_PIN_SET ? 1U : 0U;
+}
+
+static void ew_gpio_init(void)
+{
+    GPIO_InitTypeDef g = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    ew_scl(1U);
+    ew_sda(1U);
+    g.Pin = GPIO_PIN_8 | GPIO_PIN_9;
+    g.Mode = GPIO_MODE_OUTPUT_OD;
+    g.Pull = GPIO_PULLUP;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &g);
+}
+
+static void ew_start(void)
+{
+    ew_sda(1U);
+    ew_scl(1U);
+    ew_delay();
+    ew_sda(0U);
+    ew_delay();
+    ew_scl(0U);
+    ew_delay();
+}
+
+static void ew_stop(void)
+{
+    ew_sda(0U);
+    ew_delay();
+    ew_scl(1U);
+    ew_delay();
+    ew_sda(1U);
+    ew_delay();
+}
+
+static uint32_t ew_write_byte(uint8_t value)
+{
+    uint32_t acked;
+
+    for (int8_t bit = 7; bit >= 0; bit--) {
+        ew_sda((value >> bit) & 1U);
+        ew_delay();
+        ew_scl(1U);
+        ew_delay();
+        ew_scl(0U);
+    }
+    ew_sda(1U); /* release for ACK */
+    ew_delay();
+    ew_scl(1U);
+    ew_delay();
+    acked = ew_sda_read() == 0U ? 1U : 0U;
+    ew_scl(0U);
+    ew_delay();
+    return acked;
+}
+
+static uint8_t ew_read_byte(uint32_t send_ack)
+{
+    uint8_t value = 0U;
+
+    ew_sda(1U); /* release the line */
+    for (int8_t bit = 7; bit >= 0; bit--) {
+        ew_delay();
+        ew_scl(1U);
+        ew_delay();
+        value = (uint8_t)((value << 1) | (uint8_t)ew_sda_read());
+        ew_scl(0U);
+    }
+    ew_sda(send_ack != 0U ? 0U : 1U);
+    ew_delay();
+    ew_scl(1U);
+    ew_delay();
+    ew_scl(0U);
+    ew_sda(1U);
+    ew_delay();
+    return value;
+}
+
+static uint32_t ew_read_all(void)
+{
+    ew_start();
+    if (ew_write_byte((uint8_t)(EDID_EE_ADDR << 1)) == 0U) {
+        ew_stop();
+        return 0U;
+    }
+    if (ew_write_byte(0x00U) == 0U) {
+        ew_stop();
+        return 0U;
+    }
+    ew_start();
+    if (ew_write_byte((uint8_t)((EDID_EE_ADDR << 1) | 1U)) == 0U) {
+        ew_stop();
+        return 0U;
+    }
+    for (uint32_t i = 0U; i < 256U; i++) {
+        g_edid_dump[i] = ew_read_byte(i < 255U ? 1U : 0U);
+    }
+    ew_stop();
+    return 1U;
+}
+
+static uint32_t ew_write_page(uint32_t offset, const uint8_t *data)
+{
+    ew_start();
+    if (ew_write_byte((uint8_t)(EDID_EE_ADDR << 1)) == 0U) {
+        ew_stop();
+        return 0U;
+    }
+    if (ew_write_byte((uint8_t)offset) == 0U) {
+        ew_stop();
+        return 0U;
+    }
+    for (uint32_t i = 0U; i < 8U; i++) {
+        if (ew_write_byte(data[i]) == 0U) {
+            ew_stop();
+            return 0U;
+        }
+    }
+    ew_stop();
+    HAL_Delay(10); /* EEPROM internal write cycle */
+    return 1U;
+}
+
+static void ew_halt_blink(uint16_t led_pin)
+{
+    for (;;) {
+        HAL_GPIO_TogglePin(GPIOD, led_pin);
+        HAL_Delay(200);
+    }
+}
+
+static void edid_writer_run(void)
+{
+    static const uint8_t ff_page[8] =
+        {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    ew_gpio_init();
+    HAL_Delay(100);
+
+    if (ew_read_all() == 0U) {
+        g_edid_state = 1U;
+        ew_halt_blink(LD5_Pin); /* red: no ACK - check wiring/power */
+    }
+    g_edid_state = 2U; /* armed: inspect g_edid_dump, press the USER button */
+
+    while (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_RESET) {
+        HAL_GPIO_TogglePin(GPIOD, LD6_Pin); /* blue: waiting */
+        HAL_Delay(150);
+    }
+    HAL_GPIO_WritePin(GPIOD, LD6_Pin, GPIO_PIN_RESET);
+
+    g_edid_state = 3U;
+    HAL_GPIO_WritePin(GPIOD, LD3_Pin, GPIO_PIN_SET); /* orange: writing */
+    for (uint32_t offset = 0U; offset < 256U; offset += 8U) {
+        const uint8_t *src = offset < 128U ? &edid_image[offset] : ff_page;
+
+        if (ew_write_page(offset, src) == 0U) {
+            g_edid_state = 6U;
+            g_edid_fail_offset = offset;
+            ew_halt_blink(LD5_Pin);
+        }
+    }
+    HAL_GPIO_WritePin(GPIOD, LD3_Pin, GPIO_PIN_RESET);
+
+    g_edid_state = 4U;
+    if (ew_read_all() == 0U) {
+        g_edid_state = 1U;
+        ew_halt_blink(LD5_Pin);
+    }
+    for (uint32_t i = 0U; i < 256U; i++) {
+        uint8_t expected = i < 128U ? edid_image[i] : 0xFFU;
+
+        if (g_edid_dump[i] != expected) {
+            g_edid_state = 7U;
+            g_edid_fail_offset = i;
+            ew_halt_blink(LD5_Pin);
+        }
+    }
+
+    g_edid_state = 5U;
+    ew_halt_blink(LD4_Pin); /* green: written and verified */
+}
+#endif /* EDID_WRITER_MODE */
 
 /* USER CODE END 0 */
 
@@ -104,7 +355,9 @@ int main(void)
   DCMI_Capture_Init();
   WS2812_Init();
   /* USER CODE BEGIN 2 */
-
+#if EDID_WRITER_MODE
+  edid_writer_run(); /* never returns; see flow notes above */
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
