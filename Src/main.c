@@ -111,6 +111,10 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    /* No HAL_Delay here: capture completion is detected by polling the DMA
+     * counter, so a 1 ms sleep per pass adds milliseconds of latency to
+     * every capture. The loop is naturally paced by the video frame rate.
+     */
     DCMI_Capture_Task();
     if (DCMI_Capture_ConsumeLedUpdate() != 0U) {
       WS2812_TaskEdgeZonesRgb(g_dcmi_led_zone_r,
@@ -118,7 +122,7 @@ int main(void)
                               g_dcmi_led_zone_b,
                               DCMI_LED_ZONE_COUNT);
     }
-    HAL_Delay(1);
+    WS2812_Flush();
 
     /* USER CODE END WHILE */
 

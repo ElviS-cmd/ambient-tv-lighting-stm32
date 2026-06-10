@@ -92,6 +92,10 @@ static uint32_t ws2812_dma_available;
  * volatile so optimized builds re-read them in the task context. */
 static volatile uint32_t ws2812_dma_busy;
 static volatile uint32_t ws2812_dma_start_ms;
+/* A frame arrived while the previous strip transmission was still on the
+ * wire. WS2812_Flush() retransmits the current colors once DMA frees up,
+ * so a fast scene change landing mid-transmit is deferred, not dropped. */
+static volatile uint32_t ws2812_frame_pending;
 static uint32_t last_update_ms;
 static uint8_t ws2812_prev_zone_raw_r[WS2812_INPUT_ZONE_COUNT];
 static uint8_t ws2812_prev_zone_raw_g[WS2812_INPUT_ZONE_COUNT];
@@ -331,6 +335,21 @@ void WS2812_TaskEdgeZonesRgb(const volatile uint32_t *zone_r,
     }
 }
 
+void WS2812_Flush(void)
+{
+    if (ws2812_frame_pending == 0U) {
+        return;
+    }
+
+    /* ws2812_leds still holds the deferred frame; re-encode and send it.
+     * If DMA is still busy this re-latches the pending flag and we try
+     * again on the next main-loop pass.
+     */
+    if (show() == 1U) {
+        last_update_ms = HAL_GetTick();
+    }
+}
+
 void WS2812_Clear(void)
 {
     for (uint32_t i = 0U; i < WS2812_LED_COUNT; i++) {
@@ -350,6 +369,7 @@ void WS2812_Clear(void)
     }
 
     ws2812_force_idle_low();
+    ws2812_frame_pending = 0U;
 
     (void)show();
 
@@ -525,6 +545,7 @@ static uint32_t show_tim_dma(void)
             __enable_irq();
             return 0U;
         }
+        ws2812_frame_pending = 1U;
         return 2U;
     }
 
@@ -557,6 +578,7 @@ static uint32_t show_tim_dma(void)
     }
     g_ws2812_dma_started_count++;
     ws2812_dma_start_ms = HAL_GetTick();
+    ws2812_frame_pending = 0U;
     return 1U;
 }
 
