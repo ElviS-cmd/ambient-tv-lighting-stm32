@@ -102,6 +102,33 @@
  * 29-row span, so at worst the bottom zone is slightly under-sampled.
  */
 #define DCMI_SIDE_VERTICAL_TIMEOUT_MISSING_WORDS 140U
+/* Black-border (letterbox/pillarbox) detection. Letterboxed video would
+ * otherwise park the top/bottom LEDs on the black bars for the whole movie.
+ * Each edge capture that comes back fully black - while another edge shows
+ * content, so dark scenes do not trigger it - grows that edge's inset after
+ * a sustained streak, walking the crop inward until it lands on picture.
+ * Periodic outward probes at inset 0 snap the edge back the moment the bars
+ * disappear; probe captures that still see black are discarded so the LEDs
+ * keep their content colors.
+ *
+ * Levels are on the baseline-rescaled 0..255 scale. Streaks count accepted
+ * captures of that edge (each edge is captured every 4th slot in vertical
+ * mode, roughly 15 per second).
+ */
+#define DCMI_BLACK_BORDER_DETECT 1U
+#define DCMI_BORDER_BLACK_LEVEL 12U
+#define DCMI_BORDER_CONTENT_LEVEL 40U
+#define DCMI_BORDER_GROW_STREAK 45U
+#define DCMI_BORDER_WALK_STREAK 4U
+#define DCMI_BORDER_STEP 16U
+#define DCMI_BORDER_MAX_INSET_LINES 160U
+#define DCMI_BORDER_MAX_SIDE_INSET_PIXELS 192U
+#define DCMI_BORDER_PROBE_INTERVAL 64U
+#if DCMI_BLACK_BORDER_DETECT && !DCMI_CROP_TEST_MODE && !DCMI_FULL_HEIGHT_SIDE_TEST_MODE
+#define DCMI_BORDER_ACTIVE 1U
+#else
+#define DCMI_BORDER_ACTIVE 0U
+#endif
 #define DCMI_BOTTOM_TIMED_BAND 0U
 #define DCMI_BOTTOM_START_DELAY_MS 8U
 /* Adaptive temporal smoothing. alpha is the fraction of the new raw value:
@@ -386,6 +413,21 @@ static volatile uint32_t g_dcmi_observed_baseline_b;                   /* Observ
 static volatile uint32_t g_dcmi_zone_spike_reject_count;
 static volatile uint32_t g_dcmi_zone_low_trust_spike_count;
 static volatile uint32_t g_dcmi_global_cut_count;
+#if DCMI_BORDER_ACTIVE
+/* Detected border insets, indexed by dcmi_edge_t. TOP/BOTTOM are lines,
+ * RIGHT/LEFT are pixels, all measured inward from that edge of the panel. */
+static volatile uint32_t g_dcmi_border_inset[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_border_grow_count;
+static volatile uint32_t g_dcmi_border_reset_count;
+static volatile uint32_t g_dcmi_border_giveup_count;
+static volatile uint32_t g_dcmi_border_probe_count;
+static volatile uint32_t g_dcmi_border_probe_discard_count;
+static uint32_t border_black_streak[DCMI_EDGE_COUNT];
+static uint32_t border_walking[DCMI_EDGE_COUNT];
+static uint32_t border_capture_count[DCMI_EDGE_COUNT];
+static uint32_t border_edge_level[DCMI_EDGE_COUNT];
+static uint32_t active_capture_is_probe;
+#endif
 static volatile uint32_t g_dcmi_zone_miss_hold_count;
 static volatile uint32_t g_dcmi_zone_miss_decay_count;
 static volatile uint32_t g_dcmi_frame_publish_skip_count;
@@ -507,6 +549,13 @@ static uint32_t edge_local_zone(uint32_t edge, uint32_t x, uint32_t y,
 static void side_band_zone_pair(uint32_t *right_zone, uint32_t *left_zone);
 static void accumulate_led_zone_sample(uint32_t led_zone, uint32_t sample);
 static void build_column_zone_map(void);
+#if DCMI_BORDER_ACTIVE
+static uint32_t border_inset_limit(uint32_t edge);
+static void border_adjust_crop(uint32_t *crop_x, uint32_t *crop_y,
+                               uint32_t *crop_width, uint32_t *crop_height);
+static uint32_t border_process_capture(uint32_t max_level,
+                                       uint32_t candidate_zones);
+#endif
 #if DCMI_DIAGNOSTICS
 static void analyze_buffer_diagnostics(uint32_t words_to_analyze);
 #endif
@@ -927,6 +976,10 @@ static void start_snapshot(void)
     }
     #endif
 
+#if DCMI_BORDER_ACTIVE
+    border_adjust_crop(&crop_x, &crop_y, &crop_width, &crop_height);
+#endif
+
     dcmi_y = cartesian_y_to_dcmi_y(crop_y, crop_height);
 
     #if DCMI_BOTTOM_TIMED_BAND
@@ -1289,6 +1342,220 @@ static void build_column_zone_map(void)
         column_zone_map[x] = keep != 0U ? DCMI_COLUMN_ROW_ZONE : DCMI_COLUMN_SKIP;
     }
 }
+
+#if DCMI_BORDER_ACTIVE
+static uint32_t border_inset_limit(uint32_t edge)
+{
+    if (edge == DCMI_EDGE_TOP || edge == DCMI_EDGE_BOTTOM) {
+        return DCMI_BORDER_MAX_INSET_LINES;
+    }
+#if DCMI_SIDE_HORIZONTAL_BANDS
+    /* Horizontal side bands read the panel's outer columns directly and
+     * cannot reposition in x, so pillarbox detection is off in band mode. */
+    return 0U;
+#else
+    return DCMI_BORDER_MAX_SIDE_INSET_PIXELS;
+#endif
+}
+
+/* Reshape the table crop so the active capture samples the detected content
+ * rectangle instead of the panel edge, and decide whether this capture is an
+ * outward probe (own inset forced to 0 to check whether the bars are gone).
+ * Works in the same cartesian coordinates as the crop table. The zone math
+ * needs no changes: edge_local_zone() divides whatever crop geometry it is
+ * given proportionally, so zones redistribute over the visible picture.
+ */
+static void border_adjust_crop(uint32_t *crop_x, uint32_t *crop_y,
+                               uint32_t *crop_width, uint32_t *crop_height)
+{
+    uint32_t inset_top;
+    uint32_t inset_bottom;
+    uint32_t inset_left;
+    uint32_t inset_right;
+
+    active_capture_is_probe = 0U;
+
+    if (active_crop_index >= DCMI_EDGE_COUNT) {
+        return;
+    }
+
+    border_capture_count[active_crop_index]++;
+    if (g_dcmi_border_inset[active_crop_index] > 0U &&
+        (border_capture_count[active_crop_index] %
+         DCMI_BORDER_PROBE_INTERVAL) == 0U) {
+        active_capture_is_probe = 1U;
+        g_dcmi_border_probe_count++;
+    }
+
+    inset_top = g_dcmi_border_inset[DCMI_EDGE_TOP];
+    inset_bottom = g_dcmi_border_inset[DCMI_EDGE_BOTTOM];
+    inset_left = g_dcmi_border_inset[DCMI_EDGE_LEFT];
+    inset_right = g_dcmi_border_inset[DCMI_EDGE_RIGHT];
+
+    if (active_capture_is_probe != 0U) {
+        switch (active_crop_index) {
+        case DCMI_EDGE_TOP:
+            inset_top = 0U;
+            break;
+        case DCMI_EDGE_BOTTOM:
+            inset_bottom = 0U;
+            break;
+        case DCMI_EDGE_RIGHT:
+            inset_right = 0U;
+            break;
+        default:
+            inset_left = 0U;
+            break;
+        }
+    }
+
+    if (active_crop_index == DCMI_EDGE_TOP ||
+        active_crop_index == DCMI_EDGE_BOTTOM) {
+        /* Track pillarbox bars in x. Width stays a multiple of four for the
+         * word-aligned analysis fast path. */
+        uint32_t content_x = inset_left & ~3U;
+
+        if ((inset_left + inset_right) < VIDEO_ACTIVE_WIDTH) {
+            uint32_t content_width =
+                (VIDEO_ACTIVE_WIDTH - inset_right - content_x) & ~3U;
+
+            if (content_width >= 256U) {
+                *crop_x = content_x;
+                *crop_width = content_width;
+            }
+        }
+
+        if (active_crop_index == DCMI_EDGE_TOP) {
+            *crop_y = VIDEO_ACTIVE_HEIGHT - inset_top -
+                      DCMI_TOP_CROP_INSET_LINES - EDGE_BORDER_PIXELS;
+        } else {
+            *crop_y = inset_bottom + DCMI_BOTTOM_CROP_INSET_LINES;
+        }
+        return;
+    }
+
+    /* Side edges: span the content rows. The 32-line top/bottom design
+     * insets apply here too, so side zones sample the same vertical extent
+     * the top/bottom bands consider real picture.
+     */
+    {
+        uint32_t y0 = inset_bottom + DCMI_BOTTOM_CROP_INSET_LINES;
+        uint32_t y1 = VIDEO_ACTIVE_HEIGHT - inset_top - DCMI_TOP_CROP_INSET_LINES;
+#if DCMI_SIDE_HORIZONTAL_BANDS
+        /* Fallback path: keep band y positions inside the content rows;
+         * bands aimed at a bar compress onto the content boundary. */
+        uint32_t max_band_y = y1 >= EDGE_BORDER_PIXELS ?
+                              y1 - EDGE_BORDER_PIXELS : 0U;
+
+        if (*crop_y < y0) {
+            *crop_y = y0;
+        }
+        if (*crop_y > max_band_y) {
+            *crop_y = max_band_y;
+        }
+        (void)crop_x;
+        (void)crop_width;
+        (void)crop_height;
+#else
+        if (y1 > y0 && (y1 - y0) >= 128U) {
+            *crop_y = y0;
+            *crop_height = y1 - y0;
+        }
+        if (active_crop_index == DCMI_EDGE_RIGHT) {
+            *crop_x = VIDEO_ACTIVE_WIDTH - inset_right - DCMI_SIDE_CROP_WIDTH;
+        } else {
+            *crop_x = inset_left;
+        }
+        (void)crop_width;
+#endif
+    }
+}
+
+/* Update border state from one accepted capture. Returns 1 when the capture
+ * was an outward probe that still saw black: the caller must discard its
+ * samples so the LEDs keep their content colors.
+ */
+static uint32_t border_process_capture(uint32_t max_level,
+                                       uint32_t candidate_zones)
+{
+    uint32_t edge = active_crop_index;
+    uint32_t probe;
+    uint32_t black;
+    uint32_t content_elsewhere = 0U;
+
+    if (edge >= DCMI_EDGE_COUNT) {
+        return 0U;
+    }
+
+    probe = active_capture_is_probe;
+    active_capture_is_probe = 0U;
+
+    /* Too few valid zones is transport trouble, not a border verdict. */
+    if (candidate_zones < (edge_zone_count(edge) / 2U)) {
+        if (probe != 0U) {
+            g_dcmi_border_probe_discard_count++;
+        }
+        return probe;
+    }
+
+    black = max_level <= DCMI_BORDER_BLACK_LEVEL ? 1U : 0U;
+
+    for (uint32_t other = 0U; other < DCMI_EDGE_COUNT; other++) {
+        if (other != edge &&
+            border_edge_level[other] >= DCMI_BORDER_CONTENT_LEVEL) {
+            content_elsewhere = 1U;
+        }
+    }
+
+    if (probe != 0U) {
+        if (black != 0U) {
+            /* Bars still present: keep the content crop, drop this data. */
+            g_dcmi_border_probe_discard_count++;
+            return 1U;
+        }
+        /* Picture reaches the panel edge again: snap fully out. The probe
+         * samples are the real new edge, so publish them. */
+        g_dcmi_border_inset[edge] = 0U;
+        border_black_streak[edge] = 0U;
+        border_walking[edge] = 0U;
+        border_edge_level[edge] = max_level;
+        g_dcmi_border_reset_count++;
+        return 0U;
+    }
+
+    border_edge_level[edge] = max_level;
+
+    if (black != 0U && content_elsewhere != 0U &&
+        border_inset_limit(edge) > 0U) {
+        uint32_t streak_needed = border_walking[edge] != 0U ?
+            DCMI_BORDER_WALK_STREAK : DCMI_BORDER_GROW_STREAK;
+
+        border_black_streak[edge]++;
+        if (border_black_streak[edge] >= streak_needed) {
+            border_black_streak[edge] = 0U;
+            if ((g_dcmi_border_inset[edge] + DCMI_BORDER_STEP) <=
+                border_inset_limit(edge)) {
+                g_dcmi_border_inset[edge] += DCMI_BORDER_STEP;
+                border_walking[edge] = 1U;
+                g_dcmi_border_grow_count++;
+            } else {
+                /* Walked to the limit without finding picture: a dark scene
+                 * slipped the guard, not a border. Snap back out. */
+                g_dcmi_border_inset[edge] = 0U;
+                border_walking[edge] = 0U;
+                g_dcmi_border_giveup_count++;
+            }
+        }
+    } else {
+        border_black_streak[edge] = 0U;
+        if (black == 0U) {
+            border_walking[edge] = 0U;
+        }
+    }
+
+    return 0U;
+}
+#endif /* DCMI_BORDER_ACTIVE */
 
 #if DCMI_DIAGNOSTICS
 /* Debug-only whole-buffer statistics: the slow per-sample pass the LED
@@ -2011,11 +2278,13 @@ static void finalize_incremental_capture(void)
     {
         uint32_t candidate_zones = 0U;
         uint32_t big_delta_zones = 0U;
+        uint32_t capture_max_level = 0U;
 
         for (uint32_t zone_index = 0U; zone_index < DCMI_LED_ZONE_COUNT; zone_index++) {
             uint32_t raw_r;
             uint32_t raw_g;
             uint32_t raw_b;
+            uint32_t level;
             uint32_t delta;
             uint32_t channel_delta;
 
@@ -2028,6 +2297,16 @@ static void finalize_incremental_capture(void)
             raw_r = led_zone_red_sum[zone_index] / led_zone_weight_sum[zone_index];
             raw_g = led_zone_green_sum[zone_index] / led_zone_weight_sum[zone_index];
             raw_b = led_zone_blue_sum[zone_index] / led_zone_weight_sum[zone_index];
+            level = raw_r;
+            if (raw_g > level) {
+                level = raw_g;
+            }
+            if (raw_b > level) {
+                level = raw_b;
+            }
+            if (level > capture_max_level) {
+                capture_max_level = level;
+            }
             delta = (raw_r > smoothed_led_zone_r[zone_index]) ?
                     (raw_r - smoothed_led_zone_r[zone_index]) :
                     (smoothed_led_zone_r[zone_index] - raw_r);
@@ -2049,6 +2328,15 @@ static void finalize_incremental_capture(void)
                 big_delta_zones++;
             }
         }
+
+#if DCMI_BORDER_ACTIVE
+        if (border_process_capture(capture_max_level, candidate_zones) != 0U) {
+            /* Outward probe still sees the black bar: discard this capture
+             * so the LEDs keep their content colors. */
+            g_dcmi_frame_publish_skip_count++;
+            return;
+        }
+#endif
 
         if (candidate_zones >= DCMI_GLOBAL_CUT_MIN_ZONES &&
             big_delta_zones * DCMI_GLOBAL_CUT_DEN >=

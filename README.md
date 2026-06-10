@@ -102,12 +102,15 @@ All in `Src/dcmi_capture.c`:
 | `DCMI_FULL_HEIGHT_SIDE_TEST_MODE` | `1` | Transport test: holds capture on one vertical left-edge segment and reports reliability through `g_dcmi_side_test_*` counters. **Does not drive the LEDs.** Set to `0` for normal operation. |
 | `DCMI_SIDE_VERTICAL_CROPS` | `1` | Production side strategy: full-height 28x720 side crops; all side zones refresh every ~4-capture perimeter cycle. Set to `0` to fall back to the proven 1280x16 horizontal side bands. |
 | `DCMI_DIAGNOSTICS` | `0` | Compiles the per-sample debug statistics (bit histogram, checksums, byte min/max) back into `analyze_buffer()`. Costs more CPU than the LED path itself; enable only while debugging. |
+| `DCMI_BLACK_BORDER_DETECT` | `1` | Letterbox/pillarbox detection: edges that stay black while other edges show content walk their crops inward onto the picture; periodic outward probes snap back when the bars disappear. Watch `g_dcmi_border_inset[]` in the debugger. |
 
 The Debug build configuration compiles at `-O2`; telemetry globals are
 `volatile` so live debugger watches keep working under optimization.
 
 `tools/latency_sim.c` is a host-side model of the capture schedulers and
-smoothing policies (`cc -O2 -o latency_sim latency_sim.c && ./latency_sim`).
+smoothing policies, and `tools/border_sim.c` exercises the black-border
+detector against letterbox, pillarbox, dark-scene, and fullscreen-return
+scenarios (`cc -O2 -Wall -o sim <file>.c && ./sim`).
 
 ## Bench Checklist (next hardware session)
 
@@ -120,6 +123,10 @@ smoothing policies (`cc -O2 -o latency_sim latency_sim.c && ./latency_sim`).
 4. Sanity-check the new behavior: scene cuts should land on the next
    perimeter pass (watch `g_dcmi_global_cut_count`), and LED updates landing
    during a strip transmission are deferred, not dropped.
+5. Play a letterboxed YouTube video: within ~4 seconds the top/bottom LEDs
+   should pick up the picture instead of staying dark
+   (`g_dcmi_border_inset[0]`/`[2]` settle around the bar height), and going
+   fullscreen should snap them back within a few seconds.
 
 ## Building and Flashing
 
