@@ -99,7 +99,8 @@ All in `Src/dcmi_capture.c`:
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `DCMI_FULL_HEIGHT_SIDE_TEST_MODE` | `1` | Transport test: holds capture on one vertical left-edge segment and reports reliability through `g_dcmi_side_test_*` counters. **Does not drive the LEDs.** Set to `0` for normal operation. |
+| `DCMI_FULL_HEIGHT_SIDE_TEST_MODE` | `1` | Transport test: cycles four `28x180` vertical segments on both sides after complete `28x720` restart-per-side crops failed validation. It records whether segments meet the 50 ms production target, then permits an 80 ms recovery window. **Does not drive the LEDs.** Set to `0` for normal operation. |
+| `DCMI_PREARM_CAPTURE` | `0` | Current transport experiment: wait for the next VSYNC before starting each crop. Immediate re-arm produced roughly 20% zero captures; a missed VSYNC now keeps the crop queued for another alignment attempt instead of launching DMA unsynchronized. |
 | `DCMI_SIDE_VERTICAL_CROPS` | `1` | Production side strategy: full-height 28x720 side crops; all side zones refresh every ~4-capture perimeter cycle. Set to `0` to fall back to the proven 1280x16 horizontal side bands. |
 | `DCMI_DIAGNOSTICS` | `0` | Compiles the per-sample debug statistics (bit histogram, checksums, byte min/max) back into `analyze_buffer()`. Costs more CPU than the LED path itself; enable only while debugging. |
 | `DCMI_BLACK_BORDER_DETECT` | `1` | Letterbox/pillarbox detection: edges that stay black while other edges show content walk their crops inward onto the picture; periodic outward probes snap back when the bars disappear. Watch `g_dcmi_border_inset[]` in the debugger. |
@@ -114,8 +115,15 @@ scenarios (`cc -O2 -Wall -o sim <file>.c && ./sim`).
 
 ## Bench Checklist (next hardware session)
 
-1. Flash as-is and run the side transport test on a fast-motion clip;
-   `g_dcmi_side_test_full_count` should dominate `partial`/`zero` counts.
+1. Flash as-is and run the segmented side transport test on a fast-motion
+   clip. Watch `g_dcmi_side_test_verdict_by_segment[1][0..3]` (right) and
+   `[3][0..3]` (left): `0` means fewer than 100 attempts collected, `1` means
+   pass, and `2` means fail. Every segment must pass. A pass requires at least
+   95% full/near-full captures and no more than 1% zero captures within the
+   80 ms recovery window. Compare
+   `g_dcmi_side_test_full_within_target_permille[]` against
+   `g_dcmi_side_test_late_full_by_edge[]`: late full crops identify a
+   start/VSYNC phase problem even if the recovery verdict passes.
 2. If the verdict is good: set `DCMI_FULL_HEIGHT_SIDE_TEST_MODE` to `0` and
    verify the strip; side edges should now track motion within ~100 ms.
 3. If full-height crops are unreliable: also set `DCMI_SIDE_VERTICAL_CROPS`

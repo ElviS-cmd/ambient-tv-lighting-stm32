@@ -3,6 +3,21 @@
 
 #include "main.h"
 
+/* Video source mode. Selects the expected frame geometry (dcmi_capture.c)
+ * and the DCMI sync polarities (main.c) together, so geometry and polarity
+ * can never disagree:
+ *
+ * 0 = CEA 1280x720 via the splitter's EDID. Positive sync pulses, so the
+ *     blanking level on the sync pins is HIGH/HIGH. The historical config.
+ * 1 = stock TFP401 EDID, Mac direct: 800x480 @ 65.7 Hz, 32 MHz. Negative
+ *     sync pulses -> LOW/LOW. Bench-validated 2026-06: ~4700 captures,
+ *     100% full, zero sync timeouts.
+ * 2 = AMBILIGHT EDID (tools/edid): 1280x720 @ 49.94 Hz CVT-RB, 53 MHz.
+ *     HSync positive / VSync negative -> HIGH/LOW. Use after programming
+ *     the TFP401 EEPROM (direct or through the EDID-clone dongle).
+ */
+#define DCMI_SOURCE_MODE 1U
+
 #define DCMI_LED_ZONE_COUNT 136U
 
 extern volatile uint32_t g_dcmi_led_zone_r[DCMI_LED_ZONE_COUNT];

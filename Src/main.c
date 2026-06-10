@@ -210,6 +210,18 @@ static void MX_DCMI_Init(void)
   __HAL_DCMI_DISABLE_IT(&hdcmi, DCMI_IT_LINE | DCMI_IT_VSYNC |
                                DCMI_IT_ERR | DCMI_IT_OVR | DCMI_IT_FRAME);
 
+  /* Sync polarity per source mode (see DCMI_SOURCE_MODE in dcmi_capture.h).
+   * The HIGH/HIGH init above matches mode 0 (CEA 720p, positive pulses).
+   * Overridden here in user code so CubeMX regeneration keeps it.
+   */
+#if DCMI_SOURCE_MODE == 1U
+  /* Stock TFP401 EDID 800x480: both sync pulses negative -> blanking LOW. */
+  DCMI->CR &= ~(DCMI_CR_VSPOL | DCMI_CR_HSPOL);
+#elif DCMI_SOURCE_MODE == 2U
+  /* AMBILIGHT 720p50-RB EDID: HSync positive, VSync negative. */
+  DCMI->CR &= ~DCMI_CR_VSPOL;
+#endif
+
   /* USER CODE END DCMI_Init 2 */
 
 }

@@ -3,8 +3,13 @@
 /* NOTE: these dimensions describe what we EXPECT from the source. Tune them
  * to match the actual Computer's/TFP401 resolution. They drive the crop windows for
  * each edge — wrong values mean we sample the wrong part of the frame. */
+#if DCMI_SOURCE_MODE == 1U
+#define VIDEO_ACTIVE_WIDTH 800U
+#define VIDEO_ACTIVE_HEIGHT 480U
+#else
 #define VIDEO_ACTIVE_WIDTH 1280U
 #define VIDEO_ACTIVE_HEIGHT 720U
+#endif
 #define EDGE_BORDER_PIXELS 16U
 #define DCMI_SIDE_CROP_WIDTH 28U
 #define DCMI_TOP_CROP_INSET_LINES 32U
@@ -46,7 +51,11 @@
 #define DCMI_CROP_TEST_MODE 0U
 #define DCMI_CROP_TEST_CAPTURE_TIMEOUT_MS 50U
 #define DCMI_USE_CROP 1U
-#define DCMI_PREARM_CAPTURE 1U
+/* Transport-test result: immediate re-arm after a fast DCMI stop produced
+ * roughly 20% zero captures on both sides. Align each new crop to the next
+ * VSYNC so its requested rows have not already passed in the current frame.
+ */
+#define DCMI_PREARM_CAPTURE 0U
 #define DCMI_LED_ACTIVITY_WINDOW_MS 1000U
 /* Set to 1 to compile the per-sample debug statistics in analyze_buffer()
  * (bit histogram, checksums, byte min/max, coarse 4-zone averages). These
@@ -54,21 +63,32 @@
  * time is dead time between captures. Keep 0 for normal ambilight use.
  */
 #define DCMI_DIAGNOSTICS 0U
-/* Controlled experiment: repeatedly capture a narrow vertical side crop.
- * Keep the height configurable so transport reliability can be compared
- * directly between a complete 720-line side and a short 180-line segment.
- * Set to 0 to restore the working horizontal-band path.
+/* Controlled experiment: alternate four 28x180 vertical segments across the
+ * left and right sides. A complete 28x720 restart-per-side crop proved
+ * unreliable: extending its timeout from 50 ms to 80 ms recovered no late
+ * full captures. Segmenting preserves per-zone side data while reducing each
+ * DMA request to one quarter of the full-height transfer.
+ * Normal LED publishing remains disabled until every segment proves reliable.
  */
 #define DCMI_FULL_HEIGHT_SIDE_TEST_MODE 1U
 #define DCMI_FULL_HEIGHT_SIDE_TEST_EDGE 3U /* DCMI_EDGE_LEFT */
-#define DCMI_FULL_HEIGHT_SIDE_TEST_HEIGHT 180U
-#define DCMI_FULL_HEIGHT_SIDE_TEST_Y \
-    ((VIDEO_ACTIVE_HEIGHT - DCMI_FULL_HEIGHT_SIDE_TEST_HEIGHT) / 2U)
-#define DCMI_FULL_HEIGHT_SIDE_TEST_TIMEOUT_MS 50U
+#define DCMI_FULL_HEIGHT_SIDE_TEST_ALTERNATE_EDGES 1U
+#define DCMI_SIDE_TEST_SEGMENT_COUNT 4U
+#define DCMI_FULL_HEIGHT_SIDE_TEST_HEIGHT \
+    (VIDEO_ACTIVE_HEIGHT / DCMI_SIDE_TEST_SEGMENT_COUNT)
+#define DCMI_FULL_HEIGHT_SIDE_TEST_TARGET_MS 50U
+/* Recovery-only window. Captures completing after TARGET_MS prove that the
+ * crop transport is viable but was armed too late for the production target.
+ * They must not be treated as evidence of a responsive production schedule.
+ */
+#define DCMI_FULL_HEIGHT_SIDE_TEST_TIMEOUT_MS 80U
 /* A 28-pixel side row is seven DMA words. Permit at most one missing tail
  * row while validating that the rest of the vertical crop is aligned.
  */
 #define DCMI_FULL_HEIGHT_SIDE_TEST_MAX_MISSING_WORDS 7U
+#define DCMI_SIDE_TEST_VERDICT_MIN_ATTEMPTS 100U
+#define DCMI_SIDE_TEST_PASS_USABLE_PERMILLE 950U
+#define DCMI_SIDE_TEST_PASS_MAX_ZERO_PERMILLE 10U
 /* Production side-edge strategy (used when the transport test mode is off):
  * 1 = capture each side as one full-height vertical crop (28x720). All 25
  *     side zones refresh every 4-capture perimeter cycle (~70-100 ms)
@@ -262,6 +282,13 @@ static volatile uint32_t g_dcmi_frame_count;
 static volatile uint32_t g_dcmi_error_count;
 static volatile uint32_t g_dcmi_timeout_count;
 static volatile uint32_t g_dcmi_restart_count;
+static volatile uint32_t g_dcmi_stop_spin_ms;
+static volatile uint32_t g_dcmi_stop_spin_max_ms;
+static volatile uint32_t g_dcmi_stop_call_count;
+static volatile uint32_t g_dcmi_stop_idle_skip_count;
+static volatile uint32_t g_dcmi_stop_fast_count;
+static volatile uint32_t g_dcmi_stop_dma_abort_status;
+static volatile uint32_t g_dcmi_stop_capture_bit_after;
 #if DCMI_DIAGNOSTICS
 static volatile uint32_t g_dcmi_first_word;
 static volatile uint32_t g_dcmi_second_word;
@@ -326,6 +353,10 @@ static volatile uint32_t g_dcmi_edge_zero_count[DCMI_EDGE_COUNT];
 static volatile uint32_t g_dcmi_edge_last_words[DCMI_EDGE_COUNT];
 static volatile uint32_t g_dcmi_sync_wait_status;
 static volatile uint32_t g_dcmi_sync_wait_ms;
+static volatile uint32_t g_dcmi_sync_wait_success_count;
+static volatile uint32_t g_dcmi_sync_wait_timeout_count;
+static volatile uint32_t g_dcmi_sync_wait_max_ms;
+static volatile uint32_t g_dcmi_sync_start_skip_count;
 #if !DCMI_CROP_TEST_MODE && !DCMI_PREARM_CAPTURE
 static volatile uint32_t g_dcmi_sync_period_ms;
 static volatile uint32_t g_dcmi_sync_rate_hz;
@@ -394,6 +425,65 @@ static volatile uint32_t g_dcmi_side_test_analyzed_words;
 static volatile uint32_t g_dcmi_side_test_full_nonzero_count;
 static volatile uint32_t g_dcmi_side_test_full_allzero_count;
 static volatile uint32_t g_dcmi_side_test_analysis_sequence;
+/* Per-side reliability verdict. Only RIGHT and LEFT entries are populated.
+ * usable = exact full + near-full (at most one missing row).
+ * verdict: 0=collecting, 1=pass, 2=fail.
+ */
+static volatile uint32_t g_dcmi_side_test_attempts_by_edge[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_full_by_edge[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_near_full_by_edge[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_partial_by_edge[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_zero_by_edge[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_usable_permille[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_zero_permille[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_verdict[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_full_within_target_by_edge[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_late_full_by_edge[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_full_within_target_permille[DCMI_EDGE_COUNT];
+/* Correlate confirmed-VSYNC starts with their eventual transport outcome.
+ * A larger first-word latency on partial/zero captures points to starting on
+ * the wrong side of the frame boundary rather than losing data mid-transfer.
+ */
+static volatile uint32_t g_dcmi_side_test_last_sync_wait_ms;
+static volatile uint32_t g_dcmi_side_test_last_first_word_ms;
+static volatile uint32_t g_dcmi_side_test_full_sync_wait_avg_ms[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_partial_sync_wait_avg_ms[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_zero_sync_wait_avg_ms[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_full_first_word_avg_ms[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_partial_first_word_avg_ms[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_full_sync_wait_sum[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_partial_sync_wait_sum[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_zero_sync_wait_sum[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_full_first_word_sum[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_partial_first_word_sum[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_full_first_word_count[DCMI_EDGE_COUNT];
+static volatile uint32_t g_dcmi_side_test_partial_first_word_count[DCMI_EDGE_COUNT];
+/* Segment order is Cartesian bottom-to-top. Only edge rows RIGHT=1 and
+ * LEFT=3 are populated. Every segment must pass before this strategy is safe
+ * for production scheduling.
+ */
+static volatile uint32_t g_dcmi_side_test_segment;
+static volatile uint32_t
+    g_dcmi_side_test_attempts_by_segment[DCMI_EDGE_COUNT][DCMI_SIDE_TEST_SEGMENT_COUNT];
+static volatile uint32_t
+    g_dcmi_side_test_full_by_segment[DCMI_EDGE_COUNT][DCMI_SIDE_TEST_SEGMENT_COUNT];
+static volatile uint32_t
+    g_dcmi_side_test_partial_by_segment[DCMI_EDGE_COUNT][DCMI_SIDE_TEST_SEGMENT_COUNT];
+static volatile uint32_t
+    g_dcmi_side_test_zero_by_segment[DCMI_EDGE_COUNT][DCMI_SIDE_TEST_SEGMENT_COUNT];
+static volatile uint32_t
+    g_dcmi_side_test_usable_permille_by_segment[DCMI_EDGE_COUNT][DCMI_SIDE_TEST_SEGMENT_COUNT];
+static volatile uint32_t
+    g_dcmi_side_test_zero_permille_by_segment[DCMI_EDGE_COUNT][DCMI_SIDE_TEST_SEGMENT_COUNT];
+static volatile uint32_t
+    g_dcmi_side_test_full_within_target_by_segment[DCMI_EDGE_COUNT][DCMI_SIDE_TEST_SEGMENT_COUNT];
+static volatile uint32_t
+    g_dcmi_side_test_late_full_by_segment[DCMI_EDGE_COUNT][DCMI_SIDE_TEST_SEGMENT_COUNT];
+static volatile uint32_t
+    g_dcmi_side_test_full_within_target_permille_by_segment
+        [DCMI_EDGE_COUNT][DCMI_SIDE_TEST_SEGMENT_COUNT];
+static volatile uint32_t
+    g_dcmi_side_test_verdict_by_segment[DCMI_EDGE_COUNT][DCMI_SIDE_TEST_SEGMENT_COUNT];
 static volatile uint32_t g_dcmi_led_update_pending;
 static volatile uint32_t g_dcmi_zone_update_count;
 /* Per-edge zone statistics */
@@ -492,6 +582,11 @@ static uint32_t last_sync_tick_ms;
 #endif
 static uint32_t active_crop_index;
 static uint32_t next_crop_index;
+static uint32_t active_side_test_segment;
+static uint32_t next_side_test_segment;
+static uint32_t active_sync_wait_ms;
+static uint32_t active_first_word_seen;
+static uint32_t active_first_word_ms;
 static uint32_t active_capture_samples;
 static uint32_t active_capture_words;
 static uint32_t active_crop_width;
@@ -613,8 +708,62 @@ void DCMI_Capture_Init(void)
     init_rgb332_luts();
     dcmi_status.state = DCMI_CAPTURE_READY;
     g_dcmi_state = DCMI_CAPTURE_READY;
+#if DCMI_FULL_HEIGHT_SIDE_TEST_MODE
+    next_crop_index = DCMI_FULL_HEIGHT_SIDE_TEST_EDGE;
+    next_side_test_segment = 0U;
+#endif
     /* active_capture_* are recomputed per crop in start_snapshot. */
     start_snapshot();
+}
+
+/* HAL_DCMI_Stop waits for the continuous-capture CAPTURE bit to clear before
+ * disabling DCMI. That wait reached 160-180 ms during the isolated side-crop
+ * test even when DMA had already received the complete requested rectangle.
+ * In transport-test mode, disable DCMI first and abort only an active DMA
+ * stream so the next crop can be armed without waiting for a later frame.
+ * Production mode keeps the vendor HAL stop path until this experiment proves
+ * that immediate stop/re-arm is reliable.
+ */
+static void dcmi_stop_timed(void)
+{
+    uint32_t stop_start_ms = HAL_GetTick();
+
+    g_dcmi_stop_call_count++;
+    if ((hdcmi.Instance->CR & (DCMI_CR_CAPTURE | DCMI_CR_ENABLE)) == 0U &&
+        (hdcmi.DMA_Handle == NULL ||
+         hdcmi.DMA_Handle->State != HAL_DMA_STATE_BUSY)) {
+        g_dcmi_stop_spin_ms = 0U;
+        g_dcmi_stop_idle_skip_count++;
+        return;
+    }
+
+#if DCMI_FULL_HEIGHT_SIDE_TEST_MODE
+    __HAL_DCMI_DISABLE_IT(&hdcmi, DCMI_IT_LINE | DCMI_IT_VSYNC |
+                                  DCMI_IT_ERR | DCMI_IT_OVR |
+                                  DCMI_IT_FRAME);
+    CLEAR_BIT(hdcmi.Instance->CR, DCMI_CR_CAPTURE);
+    __HAL_DCMI_DISABLE(&hdcmi);
+
+    g_dcmi_stop_dma_abort_status = (uint32_t)HAL_OK;
+    if (hdcmi.DMA_Handle != NULL &&
+        hdcmi.DMA_Handle->State == HAL_DMA_STATE_BUSY) {
+        g_dcmi_stop_dma_abort_status =
+            (uint32_t)HAL_DMA_Abort(hdcmi.DMA_Handle);
+    }
+
+    hdcmi.State = HAL_DCMI_STATE_READY;
+    __HAL_UNLOCK(&hdcmi);
+    g_dcmi_stop_capture_bit_after =
+        (hdcmi.Instance->CR & DCMI_CR_CAPTURE) != 0U ? 1U : 0U;
+    g_dcmi_stop_fast_count++;
+#else
+    HAL_DCMI_Stop(&hdcmi);
+#endif
+
+    g_dcmi_stop_spin_ms = HAL_GetTick() - stop_start_ms;
+    if (g_dcmi_stop_spin_ms > g_dcmi_stop_spin_max_ms) {
+        g_dcmi_stop_spin_max_ms = g_dcmi_stop_spin_ms;
+    }
 }
 
 void DCMI_Capture_Task(void)
@@ -622,7 +771,7 @@ void DCMI_Capture_Task(void)
 
     if (dcmi_buffer_ready != 0U) {
         if (dcmi_stop_requested != 0U) {
-            HAL_DCMI_Stop(&hdcmi);
+            dcmi_stop_timed();
             dcmi_stop_requested = 0U;
                 }
 
@@ -631,17 +780,26 @@ void DCMI_Capture_Task(void)
     }
 
     if (dcmi_status.state == DCMI_CAPTURE_RUNNING) {
+        if (active_first_word_seen == 0U &&
+            hdcmi.DMA_Handle != NULL &&
+            hdcmi.DMA_Handle->Instance->NDTR < active_capture_words) {
+            active_first_word_seen = 1U;
+            active_first_word_ms = HAL_GetTick() - last_restart_ms;
+        }
+
         if (hdcmi.DMA_Handle != NULL &&
             hdcmi.DMA_Handle->Instance->NDTR == 0U) {
-            HAL_DCMI_Stop(&hdcmi);
             active_captured_words = active_capture_words;
             g_dcmi_captured_words = active_captured_words;
+            /* Record before stopping so capture_ms measures transport, not
+             * the stop wait. */
+            record_full_height_side_result(active_captured_words, 1U);
+            dcmi_stop_timed();
             g_dcmi_crop_test_last_words = active_captured_words;
             if (active_captured_words > g_dcmi_crop_test_max_words) {
                 g_dcmi_crop_test_max_words = active_captured_words;
             }
             g_dcmi_crop_test_full_count++;
-            record_full_height_side_result(active_captured_words, 1U);
 #if DCMI_CROP_TEST_MODE
             g_dcmi_crop_test_sync_max_words[g_dcmi_crop_test_sync_combo] =
                 active_captured_words;
@@ -670,11 +828,11 @@ void DCMI_Capture_Task(void)
             uint32_t accept_words = capture_accept_words();
 
             if (captured_words >= accept_words) {
-                HAL_DCMI_Stop(&hdcmi);
                 active_captured_words = captured_words;
                 g_dcmi_captured_words = active_captured_words;
-                g_dcmi_early_complete_count++;
                 record_full_height_side_result(active_captured_words, 1U);
+                dcmi_stop_timed();
+                g_dcmi_early_complete_count++;
                 mark_crop_accept(1U);
 
                 if (active_captured_words < active_capture_words) {
@@ -713,13 +871,13 @@ void DCMI_Capture_Task(void)
             g_dcmi_mis_last = DCMI->MISR;
             g_dcmi_cr_last = DCMI->CR;
             g_dcmi_dma_lisr_last = DMA2->LISR;
-            HAL_DCMI_Stop(&hdcmi);
             g_dcmi_captured_words = active_captured_words;
+            record_full_height_side_result(active_captured_words, 0U);
+            dcmi_stop_timed();
             g_dcmi_crop_test_last_words = active_captured_words;
             if (active_captured_words > g_dcmi_crop_test_max_words) {
                 g_dcmi_crop_test_max_words = active_captured_words;
             }
-            record_full_height_side_result(active_captured_words, 0U);
 #if DCMI_CROP_TEST_MODE
             if (active_captured_words >
                 g_dcmi_crop_test_sync_max_words[g_dcmi_crop_test_sync_combo]) {
@@ -886,7 +1044,7 @@ static void start_snapshot(void)
     #endif
     uint32_t dcmi_y;
 
-    HAL_DCMI_Stop(&hdcmi);
+    dcmi_stop_timed();
     __HAL_DCMI_DISABLE_IT(&hdcmi, DCMI_IT_LINE | DCMI_IT_VSYNC |
                                   DCMI_IT_ERR | DCMI_IT_OVR |
                                   DCMI_IT_FRAME);
@@ -929,12 +1087,19 @@ static void start_snapshot(void)
     crop_height = EDGE_BORDER_PIXELS;
 #endif
 #if DCMI_FULL_HEIGHT_SIDE_TEST_MODE
-    /* Hold the scheduler on one vertical side segment. Exact-length
-     * acceptance below makes this a transport test, not an LED-output mode.
+    /* Exercise complete vertical side rectangles. Exact-length acceptance
+     * below makes this a transport test, not an LED-output mode.
      */
-    active_crop_index = DCMI_FULL_HEIGHT_SIDE_TEST_EDGE;
+    active_crop_index = next_crop_index;
+    if (active_crop_index != DCMI_EDGE_RIGHT &&
+        active_crop_index != DCMI_EDGE_LEFT) {
+        active_crop_index = DCMI_FULL_HEIGHT_SIDE_TEST_EDGE;
+    }
+    g_dcmi_side_test_edge = active_crop_index;
+    active_side_test_segment = next_side_test_segment;
+    g_dcmi_side_test_segment = active_side_test_segment;
     crop_x = edge_crops[active_crop_index].x;
-    crop_y = DCMI_FULL_HEIGHT_SIDE_TEST_Y;
+    crop_y = active_side_test_segment * DCMI_FULL_HEIGHT_SIDE_TEST_HEIGHT;
     crop_width = edge_crops[active_crop_index].width;
     crop_height = DCMI_FULL_HEIGHT_SIDE_TEST_HEIGHT;
 #endif
@@ -999,6 +1164,9 @@ static void start_snapshot(void)
         active_capture_words = DCMI_CAPTURE_MAX_WORDS;
     }
     active_captured_words = 0U;
+    active_sync_wait_ms = 0U;
+    active_first_word_seen = 0U;
+    active_first_word_ms = 0U;
     dcmi_stop_requested = 0U;
     g_dcmi_requested_words = active_capture_words;
     g_dcmi_captured_words = 0U;
@@ -1042,9 +1210,12 @@ static void start_snapshot(void)
 
     /* Edge crops are tied to the source scanout. If a crop starts in the
      * middle of a frame, the target rows may already be gone and DMA will only
-     * fill a partial buffer. Wait for the next VSYNC for every crop, but keep
-     * the wait bounded so this remains soft-real-time: if sync is missed, start
-     * anyway and let the timeout path recover.
+     * fill a partial buffer. Wait for the next VSYNC for every crop.
+     *
+     * During the isolated side transport test, never start after a missed
+     * VSYNC: the previous experiment showed that the wait-timeout rate closely
+     * matched the remaining partial/zero capture rate. Keep the same crop
+     * queued and retry alignment on the next scheduler pass instead.
      */
 #if DCMI_CROP_TEST_MODE || DCMI_PREARM_CAPTURE
     /* Arm capture before the next frame instead of consuming a VSYNC event
@@ -1060,6 +1231,16 @@ static void start_snapshot(void)
 #endif
 #else
     g_dcmi_sync_wait_status = wait_for_frame_boundary();
+#if DCMI_FULL_HEIGHT_SIDE_TEST_MODE
+    if (g_dcmi_sync_wait_status == 0U) {
+        g_dcmi_sync_start_skip_count++;
+        last_restart_ms = HAL_GetTick();
+        dcmi_status.state = DCMI_CAPTURE_READY;
+        g_dcmi_state = DCMI_CAPTURE_READY;
+        return;
+    }
+    active_sync_wait_ms = g_dcmi_sync_wait_ms;
+#endif
 #endif
 
     #if DCMI_BOTTOM_TIMED_BAND
@@ -1116,7 +1297,18 @@ static void start_snapshot(void)
 #if DCMI_CROP_TEST_MODE
         next_crop_index = DCMI_EDGE_TOP;
 #elif DCMI_FULL_HEIGHT_SIDE_TEST_MODE
+#if DCMI_FULL_HEIGHT_SIDE_TEST_ALTERNATE_EDGES
+        if (active_crop_index == DCMI_EDGE_RIGHT) {
+            next_crop_index = DCMI_EDGE_LEFT;
+            next_side_test_segment =
+                (active_side_test_segment + 1U) % DCMI_SIDE_TEST_SEGMENT_COUNT;
+        } else {
+            next_crop_index = DCMI_EDGE_RIGHT;
+            next_side_test_segment = active_side_test_segment;
+        }
+#else
         next_crop_index = DCMI_FULL_HEIGHT_SIDE_TEST_EDGE;
+#endif
 #else
         next_crop_index = (next_crop_index + 1U) % DCMI_EDGE_COUNT;
 #endif
@@ -1145,6 +1337,10 @@ static uint32_t wait_for_frame_boundary(void)
             uint32_t now = HAL_GetTick();
 
             g_dcmi_sync_wait_ms = now - start_ms;
+            g_dcmi_sync_wait_success_count++;
+            if (g_dcmi_sync_wait_ms > g_dcmi_sync_wait_max_ms) {
+                g_dcmi_sync_wait_max_ms = g_dcmi_sync_wait_ms;
+            }
             if (last_sync_tick_ms != 0U) {
                 g_dcmi_sync_period_ms = now - last_sync_tick_ms;
                 g_dcmi_sync_rate_hz =
@@ -1159,6 +1355,10 @@ static uint32_t wait_for_frame_boundary(void)
     }
 
     g_dcmi_sync_wait_ms = HAL_GetTick() - start_ms;
+    g_dcmi_sync_wait_timeout_count++;
+    if (g_dcmi_sync_wait_ms > g_dcmi_sync_wait_max_ms) {
+        g_dcmi_sync_wait_max_ms = g_dcmi_sync_wait_ms;
+    }
     __HAL_DCMI_DISABLE(&hdcmi);
     return 0U;
 }
@@ -2772,13 +2972,23 @@ static void record_side_band_words(uint32_t words)
 static void record_full_height_side_result(uint32_t words, uint32_t full)
 {
 #if DCMI_FULL_HEIGHT_SIDE_TEST_MODE
+    uint32_t edge = active_crop_index;
     uint32_t capture_ms = HAL_GetTick() - last_restart_ms;
     uint32_t missing_words =
         words <= active_capture_words ? active_capture_words - words : 0U;
+    uint32_t attempts;
+    uint32_t usable;
+    uint32_t segment = active_side_test_segment;
+    uint32_t segment_attempts;
+    uint32_t segment_usable;
+    uint32_t outcome = 0U; /* 1=usable, 2=partial, 3=zero. */
 
     g_dcmi_side_test_last_words = words;
     g_dcmi_side_test_missing_words = missing_words;
     g_dcmi_side_test_last_capture_ms = capture_ms;
+    g_dcmi_side_test_last_sync_wait_ms = active_sync_wait_ms;
+    g_dcmi_side_test_last_first_word_ms =
+        active_first_word_seen != 0U ? active_first_word_ms : 0xFFFFFFFFU;
     if (words > g_dcmi_side_test_max_words) {
         g_dcmi_side_test_max_words = words;
     }
@@ -2786,15 +2996,151 @@ static void record_full_height_side_result(uint32_t words, uint32_t full)
         g_dcmi_side_test_max_capture_ms = capture_ms;
     }
 
+    if (edge < DCMI_EDGE_COUNT) {
+        g_dcmi_side_test_attempts_by_edge[edge]++;
+        if (segment < DCMI_SIDE_TEST_SEGMENT_COUNT) {
+            g_dcmi_side_test_attempts_by_segment[edge][segment]++;
+        }
+    }
+
     if (full != 0U && words == active_capture_words) {
+        outcome = 1U;
         g_dcmi_side_test_full_count++;
+        if (edge < DCMI_EDGE_COUNT) {
+            g_dcmi_side_test_full_by_edge[edge]++;
+            if (segment < DCMI_SIDE_TEST_SEGMENT_COUNT) {
+                g_dcmi_side_test_full_by_segment[edge][segment]++;
+            }
+            if (capture_ms <= DCMI_FULL_HEIGHT_SIDE_TEST_TARGET_MS) {
+                g_dcmi_side_test_full_within_target_by_edge[edge]++;
+                if (segment < DCMI_SIDE_TEST_SEGMENT_COUNT) {
+                    g_dcmi_side_test_full_within_target_by_segment[edge][segment]++;
+                }
+            } else {
+                g_dcmi_side_test_late_full_by_edge[edge]++;
+                if (segment < DCMI_SIDE_TEST_SEGMENT_COUNT) {
+                    g_dcmi_side_test_late_full_by_segment[edge][segment]++;
+                }
+            }
+        }
     } else if (words > 0U &&
                missing_words <= DCMI_FULL_HEIGHT_SIDE_TEST_MAX_MISSING_WORDS) {
+        outcome = 1U;
         g_dcmi_side_test_near_full_count++;
+        if (edge < DCMI_EDGE_COUNT) {
+            g_dcmi_side_test_near_full_by_edge[edge]++;
+            if (segment < DCMI_SIDE_TEST_SEGMENT_COUNT) {
+                g_dcmi_side_test_full_by_segment[edge][segment]++;
+            }
+        }
     } else if (words == 0U) {
+        outcome = 3U;
         g_dcmi_side_test_zero_count++;
+        if (edge < DCMI_EDGE_COUNT) {
+            g_dcmi_side_test_zero_by_edge[edge]++;
+            if (segment < DCMI_SIDE_TEST_SEGMENT_COUNT) {
+                g_dcmi_side_test_zero_by_segment[edge][segment]++;
+            }
+        }
     } else {
+        outcome = 2U;
         g_dcmi_side_test_partial_count++;
+        if (edge < DCMI_EDGE_COUNT) {
+            g_dcmi_side_test_partial_by_edge[edge]++;
+            if (segment < DCMI_SIDE_TEST_SEGMENT_COUNT) {
+                g_dcmi_side_test_partial_by_segment[edge][segment]++;
+            }
+        }
+    }
+
+    if (edge < DCMI_EDGE_COUNT) {
+        if (outcome == 1U) {
+            uint32_t usable_count =
+                g_dcmi_side_test_full_by_edge[edge] +
+                g_dcmi_side_test_near_full_by_edge[edge];
+
+            g_dcmi_side_test_full_sync_wait_sum[edge] += active_sync_wait_ms;
+            g_dcmi_side_test_full_sync_wait_avg_ms[edge] =
+                usable_count > 0U ?
+                g_dcmi_side_test_full_sync_wait_sum[edge] / usable_count : 0U;
+            if (active_first_word_seen != 0U) {
+                g_dcmi_side_test_full_first_word_sum[edge] += active_first_word_ms;
+                g_dcmi_side_test_full_first_word_count[edge]++;
+                g_dcmi_side_test_full_first_word_avg_ms[edge] =
+                    g_dcmi_side_test_full_first_word_sum[edge] /
+                    g_dcmi_side_test_full_first_word_count[edge];
+            }
+        } else if (outcome == 2U) {
+            g_dcmi_side_test_partial_sync_wait_sum[edge] += active_sync_wait_ms;
+            g_dcmi_side_test_partial_sync_wait_avg_ms[edge] =
+                g_dcmi_side_test_partial_sync_wait_sum[edge] /
+                g_dcmi_side_test_partial_by_edge[edge];
+            if (active_first_word_seen != 0U) {
+                g_dcmi_side_test_partial_first_word_sum[edge] += active_first_word_ms;
+                g_dcmi_side_test_partial_first_word_count[edge]++;
+                g_dcmi_side_test_partial_first_word_avg_ms[edge] =
+                    g_dcmi_side_test_partial_first_word_sum[edge] /
+                    g_dcmi_side_test_partial_first_word_count[edge];
+            }
+        } else if (outcome == 3U) {
+            g_dcmi_side_test_zero_sync_wait_sum[edge] += active_sync_wait_ms;
+            g_dcmi_side_test_zero_sync_wait_avg_ms[edge] =
+                g_dcmi_side_test_zero_sync_wait_sum[edge] /
+                g_dcmi_side_test_zero_by_edge[edge];
+        }
+
+        attempts = g_dcmi_side_test_attempts_by_edge[edge];
+        usable = g_dcmi_side_test_full_by_edge[edge] +
+                 g_dcmi_side_test_near_full_by_edge[edge];
+        g_dcmi_side_test_usable_permille[edge] =
+            attempts > 0U ? (usable * 1000U) / attempts : 0U;
+        g_dcmi_side_test_zero_permille[edge] =
+            attempts > 0U ?
+            (g_dcmi_side_test_zero_by_edge[edge] * 1000U) / attempts : 0U;
+        g_dcmi_side_test_full_within_target_permille[edge] =
+            attempts > 0U ?
+            (g_dcmi_side_test_full_within_target_by_edge[edge] * 1000U) /
+                attempts : 0U;
+
+        if (attempts < DCMI_SIDE_TEST_VERDICT_MIN_ATTEMPTS) {
+            g_dcmi_side_test_verdict[edge] = 0U;
+        } else if (g_dcmi_side_test_usable_permille[edge] >=
+                       DCMI_SIDE_TEST_PASS_USABLE_PERMILLE &&
+                   g_dcmi_side_test_zero_permille[edge] <=
+                       DCMI_SIDE_TEST_PASS_MAX_ZERO_PERMILLE) {
+            g_dcmi_side_test_verdict[edge] = 1U;
+        } else {
+            g_dcmi_side_test_verdict[edge] = 2U;
+        }
+
+        if (segment < DCMI_SIDE_TEST_SEGMENT_COUNT) {
+            segment_attempts =
+                g_dcmi_side_test_attempts_by_segment[edge][segment];
+            segment_usable = g_dcmi_side_test_full_by_segment[edge][segment];
+            g_dcmi_side_test_usable_permille_by_segment[edge][segment] =
+                segment_attempts > 0U ?
+                (segment_usable * 1000U) / segment_attempts : 0U;
+            g_dcmi_side_test_zero_permille_by_segment[edge][segment] =
+                segment_attempts > 0U ?
+                (g_dcmi_side_test_zero_by_segment[edge][segment] * 1000U) /
+                    segment_attempts : 0U;
+            g_dcmi_side_test_full_within_target_permille_by_segment[edge][segment] =
+                segment_attempts > 0U ?
+                (g_dcmi_side_test_full_within_target_by_segment[edge][segment] *
+                    1000U) / segment_attempts : 0U;
+
+            if (segment_attempts < DCMI_SIDE_TEST_VERDICT_MIN_ATTEMPTS) {
+                g_dcmi_side_test_verdict_by_segment[edge][segment] = 0U;
+            } else if (
+                g_dcmi_side_test_usable_permille_by_segment[edge][segment] >=
+                    DCMI_SIDE_TEST_PASS_USABLE_PERMILLE &&
+                g_dcmi_side_test_zero_permille_by_segment[edge][segment] <=
+                    DCMI_SIDE_TEST_PASS_MAX_ZERO_PERMILLE) {
+                g_dcmi_side_test_verdict_by_segment[edge][segment] = 1U;
+            } else {
+                g_dcmi_side_test_verdict_by_segment[edge][segment] = 2U;
+            }
+        }
     }
 #else
     (void)words;
