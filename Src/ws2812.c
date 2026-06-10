@@ -88,8 +88,10 @@ volatile uint32_t g_ws2812_dma_psize;        /* CR bits[12:11] — periph width 
 static ws2812_color_t ws2812_leds[WS2812_LED_COUNT];
 static uint32_t ws2812_pwm_buf[WS2812_PWM_BUF_LEN] __attribute__((aligned(4)));
 static uint32_t ws2812_dma_available;
-static uint32_t ws2812_dma_busy;
-static uint32_t ws2812_dma_start_ms;
+/* Written from the TIM2 DMA-complete interrupt via ws2812_force_idle_low();
+ * volatile so optimized builds re-read them in the task context. */
+static volatile uint32_t ws2812_dma_busy;
+static volatile uint32_t ws2812_dma_start_ms;
 static uint32_t last_update_ms;
 static uint8_t ws2812_prev_zone_raw_r[WS2812_INPUT_ZONE_COUNT];
 static uint8_t ws2812_prev_zone_raw_g[WS2812_INPUT_ZONE_COUNT];
