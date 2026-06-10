@@ -93,6 +93,34 @@ to 24 physical LEDs.
 - Logical 1 compare value: `67`
 - WS2812 reset slots: `48` (`60 us` low at 800 kHz)
 
+## Key Firmware Flags
+
+All in `Src/dcmi_capture.c`:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `DCMI_FULL_HEIGHT_SIDE_TEST_MODE` | `1` | Transport test: holds capture on one vertical left-edge segment and reports reliability through `g_dcmi_side_test_*` counters. **Does not drive the LEDs.** Set to `0` for normal operation. |
+| `DCMI_SIDE_VERTICAL_CROPS` | `1` | Production side strategy: full-height 28x720 side crops; all side zones refresh every ~4-capture perimeter cycle. Set to `0` to fall back to the proven 1280x16 horizontal side bands. |
+| `DCMI_DIAGNOSTICS` | `0` | Compiles the per-sample debug statistics (bit histogram, checksums, byte min/max) back into `analyze_buffer()`. Costs more CPU than the LED path itself; enable only while debugging. |
+
+The Debug build configuration compiles at `-O2`; telemetry globals are
+`volatile` so live debugger watches keep working under optimization.
+
+`tools/latency_sim.c` is a host-side model of the capture schedulers and
+smoothing policies (`cc -O2 -o latency_sim latency_sim.c && ./latency_sim`).
+
+## Bench Checklist (next hardware session)
+
+1. Flash as-is and run the side transport test on a fast-motion clip;
+   `g_dcmi_side_test_full_count` should dominate `partial`/`zero` counts.
+2. If the verdict is good: set `DCMI_FULL_HEIGHT_SIDE_TEST_MODE` to `0` and
+   verify the strip; side edges should now track motion within ~100 ms.
+3. If full-height crops are unreliable: also set `DCMI_SIDE_VERTICAL_CROPS`
+   to `0` to restore the horizontal-band pipeline.
+4. Sanity-check the new behavior: scene cuts should land on the next
+   perimeter pass (watch `g_dcmi_global_cut_count`), and LED updates landing
+   during a strip transmission are deferred, not dropped.
+
 ## Building and Flashing
 
 1. Install STM32CubeIDE and the STM32CubeF4 firmware package.
@@ -118,10 +146,14 @@ led flash.ioc         STM32CubeMX project configuration
 
 ## Current Status
 
-The complete capture-to-light pipeline is operational. The project remains
-under active development, with current work focused on improving side-edge
-capture scheduling, reducing response latency, and simplifying diagnostic
-instrumentation.
+The complete capture-to-light pipeline is operational. The June 2026 latency
+work rebuilt the analysis hot path around lookup tables (verified equivalent
+on 1.15M pixel positions), moved debug statistics behind a compile flag,
+added scene-cut snapping with capture-wide scene-change detection, and
+removed the fixed scheduling delays. A full-height vertical side-crop
+scheduler is implemented and waiting on the side transport test verdict
+(see the bench checklist above); until then the firmware ships in transport
+test mode.
 
 ## Engineering Lessons
 
