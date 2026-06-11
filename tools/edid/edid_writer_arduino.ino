@@ -1,17 +1,24 @@
-/* TFP401 breakout EDID EEPROM writer (Arduino Uno/Nano, 5V logic).
+/* TFP401 breakout EDID EEPROM writer (Arduino Uno/Nano or ESP32, Arduino IDE).
  *
  * Writes the custom AMBILIGHT EDID - 1280x720 @ 49.94 Hz CVT-RB, 53.00 MHz,
- * DVI-only - into the breakout's DDC EEPROM (24C02-class, I2C addr 0x50).
+ * DVI-only - into the breakout's DDC EEPROM (24LC02B, I2C addr 0x50).
  *
- * Wiring (HDMI male breakout adapter plugged into the TFP401's HDMI input):
- *   HDMI pin 15 (DDC SCL)  -> Arduino A5 (SCL)
- *   HDMI pin 16 (DDC SDA)  -> Arduino A4 (SDA)
- *   HDMI pin 17 (DDC GND)  -> Arduino GND
- *   HDMI pin 18 (+5V)      -> Arduino 5V   (powers the EEPROM)
- * Add 4.7k pull-ups from SDA and SCL to 5V if reads are unreliable.
+ * Easiest wiring: the breakout's "EDID EEPROM" STEMMA QT / JST-SH socket
+ * (next to the HDMI port). The TFP401's HDMI and its own USB power must be
+ * UNPLUGGED while programming; the V+ wire powers the EEPROM and its
+ * on-board 10k pull-ups, so the bus level follows whatever you feed V+.
  *
- * BEFORE WRITING: release the EEPROM write-protect on the breakout
- * (see the Adafruit TFP401 guide, EDID section, for the WP pad).
+ *   ESP32-WROOM (3.3V logic - NEVER feed V+ from 5V/VIN here):
+ *     Black  GND -> GND      Red    V+  -> 3V3
+ *     Blue   SDA -> GPIO21   Yellow SCL -> GPIO22
+ *
+ *   Arduino Uno/Nano (5V logic):
+ *     Black  GND -> GND      Red    V+  -> 5V
+ *     Blue   SDA -> A4       Yellow SCL -> A5
+ *
+ * (Alternative without the cable: solder to the SOT-23-5 EEPROM directly -
+ * 3-pin side outer pins are SCL/SDA, middle is GND; WP is tied to GND on
+ * the board, so writes are always enabled.)
  *
  * Usage: open the serial monitor at 115200. The sketch dumps the current
  * EDID first. Send 'W' to program, it then verifies byte-for-byte.
@@ -95,7 +102,11 @@ static bool verifyAll(void) {
 
 void setup() {
   Serial.begin(115200);
+#if defined(ARDUINO_ARCH_ESP32)
+  Wire.begin(21, 22); /* SDA, SCL */
+#else
   Wire.begin();
+#endif
   Wire.setClock(100000);
   delay(200);
   Serial.println(F("TFP401 EDID writer - AMBILIGHT 1280x720@49.94 53MHz DVI"));
