@@ -24,6 +24,21 @@
 #define WS2812_INPUT_LEFT_COUNT     25U
 #define WS2812_INPUT_BOTTOM_COUNT   43U
 #define WS2812_MAX_CHANNEL 96U
+/* Perceptual gamma (2.2) for the LED output. WS2812s are linear emitters
+ * while the captured values are display-referred, so a linear mapping makes
+ * mid-tones washed-out and dark scenes glow. Gamma also crushes any residual
+ * black floor: an input of 36/255 lands at 1/96. Set to 0 to compare with
+ * the old linear mapping.
+ */
+#define WS2812_GAMMA_CORRECTION 1U
+/* Per-channel white balance, percent of the gamma output. Tune with a full
+ * white screen until the strip's white matches the display: WS2812 greens
+ * usually dominate, so G is typically the channel to pull down first
+ * (try 100/80/95 if white looks green-cyan).
+ */
+#define WS2812_WB_R_PCT 100U
+#define WS2812_WB_G_PCT 100U
+#define WS2812_WB_B_PCT 100U
 #define WS2812_UPDATE_PERIOD_MS 12U
 #define WS2812_FAST_UPDATE_PERIOD_MS 7U
 #define WS2812_FAST_DELTA_THRESHOLD 24U
@@ -85,6 +100,28 @@ volatile uint32_t g_ws2812_ccr2_snapshot;    /* TIM2->CCR2 read after DMA start 
 volatile uint32_t g_ws2812_dma_msize;        /* CR bits[14:13] — memory width  */
 volatile uint32_t g_ws2812_dma_psize;        /* CR bits[12:11] — periph width  */
 
+#if WS2812_GAMMA_CORRECTION
+/* round(96 * (v/255)^2.2) for v = 0..255. */
+static const uint8_t ws2812_gamma_lut[256] = {
+     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+     0,  0,  0,  0,  0,  0,  0,  0,  1,  1,  1,  1,  1,  1,  1,  1,
+     1,  1,  1,  1,  1,  1,  1,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+     2,  3,  3,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,  4,  4,  4,
+     5,  5,  5,  5,  5,  5,  6,  6,  6,  6,  6,  7,  7,  7,  7,  7,
+     7,  8,  8,  8,  8,  9,  9,  9,  9,  9, 10, 10, 10, 10, 11, 11,
+    11, 11, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 15, 15, 15, 15,
+    16, 16, 16, 17, 17, 17, 18, 18, 18, 19, 19, 19, 20, 20, 20, 21,
+    21, 21, 22, 22, 23, 23, 23, 24, 24, 24, 25, 25, 26, 26, 26, 27,
+    27, 28, 28, 29, 29, 29, 30, 30, 31, 31, 32, 32, 33, 33, 33, 34,
+    34, 35, 35, 36, 36, 37, 37, 38, 38, 39, 39, 40, 40, 41, 41, 42,
+    42, 43, 44, 44, 45, 45, 46, 46, 47, 47, 48, 49, 49, 50, 50, 51,
+    51, 52, 53, 53, 54, 54, 55, 56, 56, 57, 57, 58, 59, 59, 60, 61,
+    61, 62, 63, 63, 64, 65, 65, 66, 67, 67, 68, 69, 69, 70, 71, 71,
+    72, 73, 74, 74, 75, 76, 77, 77, 78, 79, 79, 80, 81, 82, 82, 83,
+    84, 85, 86, 86, 87, 88, 89, 89, 90, 91, 92, 93, 94, 94, 95, 96
+};
+#endif
+
 static ws2812_color_t ws2812_leds[WS2812_LED_COUNT];
 static uint32_t ws2812_pwm_buf[WS2812_PWM_BUF_LEN] __attribute__((aligned(4)));
 static uint32_t ws2812_dma_available;
@@ -113,7 +150,7 @@ static uint32_t tim_dma_init(void);
 static void encode_dma_buffer(void);
 static uint32_t show_tim_dma(void);
 static uint32_t show(void);
-static uint8_t rgb_to_channel(uint32_t value);
+static uint8_t rgb_to_channel(uint32_t value, uint32_t wb_pct);
 static inline uint32_t channel_delta_u8(uint8_t a, uint8_t b);
 static void ws2812_force_idle_low(void);
 
@@ -160,9 +197,9 @@ void WS2812_TaskEdgeZonesRgb(const volatile uint32_t *zone_r,
     }
 
     for (uint32_t z = 0U; z < WS2812_INPUT_ZONE_COUNT; z++) {
-        uint8_t target_r = rgb_to_channel(zone_r[z]);
-        uint8_t target_g = rgb_to_channel(zone_g[z]);
-        uint8_t target_b = rgb_to_channel(zone_b[z]);
+        uint8_t target_r = rgb_to_channel(zone_r[z], WS2812_WB_R_PCT);
+        uint8_t target_g = rgb_to_channel(zone_g[z], WS2812_WB_G_PCT);
+        uint8_t target_b = rgb_to_channel(zone_b[z], WS2812_WB_B_PCT);
         uint32_t delta_r;
         uint32_t delta_g;
         uint32_t delta_b;
@@ -377,13 +414,19 @@ void WS2812_Clear(void)
 }
 
 
-static uint8_t rgb_to_channel(uint32_t value)
+static uint8_t rgb_to_channel(uint32_t value, uint32_t wb_pct)
 {
     if (value > 255U) {
         value = 255U;
     }
 
-    return (uint8_t)((value * WS2812_MAX_CHANNEL) / 255U);
+#if WS2812_GAMMA_CORRECTION
+    value = ws2812_gamma_lut[value];
+#else
+    value = (value * WS2812_MAX_CHANNEL) / 255U;
+#endif
+
+    return (uint8_t)((value * wb_pct) / 100U);
 }
 
 static inline uint32_t channel_delta_u8(uint8_t a, uint8_t b)

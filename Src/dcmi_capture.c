@@ -62,7 +62,7 @@
  * cost more CPU per capture than the LED color path itself, and that CPU
  * time is dead time between captures. Keep 0 for normal ambilight use.
  */
-#define DCMI_DIAGNOSTICS 0U
+#define DCMI_DIAGNOSTICS 1U
 /* Controlled experiment: alternate four 28x180 vertical segments across the
  * left and right sides. A complete 28x720 restart-per-side crop proved
  * unreliable: extending its timeout from 50 ms to 80 ms recovered no late
