@@ -200,17 +200,15 @@
 #define DCMI_BASELINE_R 45U
 #define DCMI_BASELINE_G 0U
 #define DCMI_BASELINE_B 0U
-/* Quantization and bus noise leave a dim single-channel residue in zones
- * that should be black. RGB332 is the key constraint: one green/red LSB
- * expands to 36 on the 0..255 scale, so any cutoff below 36 cannot catch a
- * one-quantum floor (green has no baseline correction, unlike R's 45).
- * Zones whose raw level is at or below this are snapped to true zero.
- * Cost: content dimmer than ~16% max-channel turns the LED off - standard
- * ambilight black-level behavior. If the measured floor globals
- * (g_dcmi_zone_floor_*) show a stable nonzero channel on a black screen,
- * fold it into DCMI_BASELINE_* instead and lower this back toward 12.
+/* Zones whose raw level is at or below this snap to true zero so smoothing
+ * cannot keep a dim glow alive on black. Bench calibration 2026-06 (five
+ * full-screen colors, splitter link): the black floor measured exactly
+ * 0/0/0 post-rescale, so a low threshold suffices - the stale green that
+ * motivated a 40-level cutoff turned out to be the frozen-zone bug, fixed
+ * separately by the incremental miss decay. Raise this only if a floor
+ * reappears on a future signal path (check g_dcmi_zone_floor_* on black).
  */
-#define DCMI_ZONE_BLACK_LEVEL 40U
+#define DCMI_ZONE_BLACK_LEVEL 16U
 
 /* Minimum samples per zone to consider data valid. Prevents stale color data
  * from previous frames when a zone doesn't receive enough samples in current frame. */
