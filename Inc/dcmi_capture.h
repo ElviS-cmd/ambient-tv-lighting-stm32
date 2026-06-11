@@ -16,7 +16,7 @@
  *     HSync positive / VSync negative -> HIGH/LOW. Use after programming
  *     the TFP401 EEPROM (direct or through the EDID-clone dongle).
  */
-#define DCMI_SOURCE_MODE 1U
+#define DCMI_SOURCE_MODE 0U
 
 #define DCMI_LED_ZONE_COUNT 136U
 

@@ -70,7 +70,7 @@
  * DMA request to one quarter of the full-height transfer.
  * Normal LED publishing remains disabled until every segment proves reliable.
  */
-#define DCMI_FULL_HEIGHT_SIDE_TEST_MODE 1U
+#define DCMI_FULL_HEIGHT_SIDE_TEST_MODE 0U
 #define DCMI_FULL_HEIGHT_SIDE_TEST_EDGE 3U /* DCMI_EDGE_LEFT */
 #define DCMI_FULL_HEIGHT_SIDE_TEST_ALTERNATE_EDGES 1U
 #define DCMI_SIDE_TEST_SEGMENT_COUNT 4U
@@ -200,6 +200,17 @@
 #define DCMI_BASELINE_R 45U
 #define DCMI_BASELINE_G 0U
 #define DCMI_BASELINE_B 0U
+/* Quantization and bus noise leave a dim single-channel residue in zones
+ * that should be black. RGB332 is the key constraint: one green/red LSB
+ * expands to 36 on the 0..255 scale, so any cutoff below 36 cannot catch a
+ * one-quantum floor (green has no baseline correction, unlike R's 45).
+ * Zones whose raw level is at or below this are snapped to true zero.
+ * Cost: content dimmer than ~16% max-channel turns the LED off - standard
+ * ambilight black-level behavior. If the measured floor globals
+ * (g_dcmi_zone_floor_*) show a stable nonzero channel on a black screen,
+ * fold it into DCMI_BASELINE_* instead and lower this back toward 12.
+ */
+#define DCMI_ZONE_BLACK_LEVEL 40U
 
 /* Minimum samples per zone to consider data valid. Prevents stale color data
  * from previous frames when a zone doesn't receive enough samples in current frame. */
@@ -520,6 +531,20 @@ static uint32_t active_capture_is_probe;
 #endif
 static volatile uint32_t g_dcmi_zone_miss_hold_count;
 static volatile uint32_t g_dcmi_zone_miss_decay_count;
+static volatile uint32_t g_dcmi_zone_black_clamp_count;
+/* Black-floor calibration aid (always on, cheap: per-zone, not per-pixel).
+ * Display a full black screen and read these: the per-capture values are the
+ * darkest zone of the latest capture, the _min values latch the darkest seen
+ * since boot. A stable nonzero channel here is the bus black floor on this
+ * signal path - fold it into the matching DCMI_BASELINE_* define. Values are
+ * post-baseline, so a correct baseline reads ~0 on black.
+ */
+static volatile uint32_t g_dcmi_zone_floor_r = 0xFFU;
+static volatile uint32_t g_dcmi_zone_floor_g = 0xFFU;
+static volatile uint32_t g_dcmi_zone_floor_b = 0xFFU;
+static volatile uint32_t g_dcmi_zone_floor_min_r = 0xFFU;
+static volatile uint32_t g_dcmi_zone_floor_min_g = 0xFFU;
+static volatile uint32_t g_dcmi_zone_floor_min_b = 0xFFU;
 static volatile uint32_t g_dcmi_frame_publish_skip_count;
 static volatile uint32_t g_dcmi_frame_quality_last;
 static volatile uint32_t g_dcmi_zone_color_delta_max;
@@ -582,8 +607,10 @@ static uint32_t last_sync_tick_ms;
 #endif
 static uint32_t active_crop_index;
 static uint32_t next_crop_index;
+#if DCMI_FULL_HEIGHT_SIDE_TEST_MODE
 static uint32_t active_side_test_segment;
 static uint32_t next_side_test_segment;
+#endif
 static uint32_t active_sync_wait_ms;
 static uint32_t active_first_word_seen;
 static uint32_t active_first_word_ms;
@@ -2310,6 +2337,7 @@ static uint32_t apply_sampled_zone(uint32_t zone_index,
     uint32_t delta_g;
     uint32_t delta_b;
     uint32_t color_delta;
+    uint32_t raw_level;
     uint32_t alpha_num = DCMI_SMOOTH_ALPHA_WEAK_NUM;
     uint32_t alpha_den = DCMI_SMOOTH_ALPHA_WEAK_DEN;
     uint32_t low_trust_zone;
@@ -2323,6 +2351,20 @@ static uint32_t apply_sampled_zone(uint32_t zone_index,
     raw_r = led_zone_red_sum[zone_index] / led_zone_weight_sum[zone_index];
     raw_g = led_zone_green_sum[zone_index] / led_zone_weight_sum[zone_index];
     raw_b = led_zone_blue_sum[zone_index] / led_zone_weight_sum[zone_index];
+    raw_level = raw_r;
+    if (raw_g > raw_level) {
+        raw_level = raw_g;
+    }
+    if (raw_b > raw_level) {
+        raw_level = raw_b;
+    }
+    if (raw_level <= DCMI_ZONE_BLACK_LEVEL) {
+        raw_r = 0U;
+        raw_g = 0U;
+        raw_b = 0U;
+        force_snap = 1U;
+        g_dcmi_zone_black_clamp_count++;
+    }
     prev_r = smoothed_led_zone_r[zone_index];
     prev_g = smoothed_led_zone_g[zone_index];
     prev_b = smoothed_led_zone_b[zone_index];
@@ -2354,15 +2396,15 @@ static uint32_t apply_sampled_zone(uint32_t zone_index,
     if (force_snap == 0U &&
         low_trust_zone != 0U &&
         color_delta >= DCMI_ZONE_LOW_TRUST_SPIKE_DELTA) {
-        /* Too few samples plus a huge jump is usually transport noise. */
+        /* Too few samples plus a huge jump is usually transport noise.
+         * The caller advances led_zone_missed_count and applies the
+         * hold/decay policy for every zone that returns 0 here.
+         */
         if (frame_spike_reject != NULL) {
             (*frame_spike_reject)++;
         }
         if (frame_low_trust_spike != NULL) {
             (*frame_low_trust_spike)++;
-        }
-        if (led_zone_missed_count[zone_index] < 0xFFFFFFFFU) {
-            led_zone_missed_count[zone_index]++;
         }
         return 0U;
     }
@@ -2457,6 +2499,7 @@ static void finalize_incremental_capture(void)
 {
     uint32_t expected_zones = 0U;
     uint32_t updated_zones = 0U;
+    uint32_t decayed_zones = 0U;
     uint32_t force_snap = 0U;
     uint32_t frame_delta_max = 0U;
     uint32_t frame_delta_sum = 0U;
@@ -2479,6 +2522,9 @@ static void finalize_incremental_capture(void)
         uint32_t candidate_zones = 0U;
         uint32_t big_delta_zones = 0U;
         uint32_t capture_max_level = 0U;
+        uint32_t floor_r = 0xFFU;
+        uint32_t floor_g = 0xFFU;
+        uint32_t floor_b = 0xFFU;
 
         for (uint32_t zone_index = 0U; zone_index < DCMI_LED_ZONE_COUNT; zone_index++) {
             uint32_t raw_r;
@@ -2497,6 +2543,15 @@ static void finalize_incremental_capture(void)
             raw_r = led_zone_red_sum[zone_index] / led_zone_weight_sum[zone_index];
             raw_g = led_zone_green_sum[zone_index] / led_zone_weight_sum[zone_index];
             raw_b = led_zone_blue_sum[zone_index] / led_zone_weight_sum[zone_index];
+            if (raw_r < floor_r) {
+                floor_r = raw_r;
+            }
+            if (raw_g < floor_g) {
+                floor_g = raw_g;
+            }
+            if (raw_b < floor_b) {
+                floor_b = raw_b;
+            }
             level = raw_r;
             if (raw_g > level) {
                 level = raw_g;
@@ -2538,6 +2593,21 @@ static void finalize_incremental_capture(void)
         }
 #endif
 
+        if (candidate_zones > 0U) {
+            g_dcmi_zone_floor_r = floor_r;
+            g_dcmi_zone_floor_g = floor_g;
+            g_dcmi_zone_floor_b = floor_b;
+            if (floor_r < g_dcmi_zone_floor_min_r) {
+                g_dcmi_zone_floor_min_r = floor_r;
+            }
+            if (floor_g < g_dcmi_zone_floor_min_g) {
+                g_dcmi_zone_floor_min_g = floor_g;
+            }
+            if (floor_b < g_dcmi_zone_floor_min_b) {
+                g_dcmi_zone_floor_min_b = floor_b;
+            }
+        }
+
         if (candidate_zones >= DCMI_GLOBAL_CUT_MIN_ZONES &&
             big_delta_zones * DCMI_GLOBAL_CUT_DEN >=
             candidate_zones * DCMI_GLOBAL_CUT_NUM) {
@@ -2552,13 +2622,44 @@ static void finalize_incremental_capture(void)
         }
 
         expected_zones++;
-        updated_zones += apply_sampled_zone(zone_index,
-                                            force_snap,
-                                            &frame_delta_max,
-                                            &frame_delta_sum,
-                                            &frame_delta_count,
-                                            &frame_spike_reject,
-                                            &frame_low_trust_spike);
+        if (apply_sampled_zone(zone_index,
+                               force_snap,
+                               &frame_delta_max,
+                               &frame_delta_sum,
+                               &frame_delta_count,
+                               &frame_spike_reject,
+                               &frame_low_trust_spike) != 0U) {
+            updated_zones++;
+            continue;
+        }
+
+        /* The zone was inside this crop but produced no trustworthy color
+         * (too few samples, or a rejected spike). Hold the previous color
+         * for a short miss streak, then fade it toward black, so a capture
+         * problem can never freeze a stale color on the strip. Mirrors the
+         * legacy full-cycle policy the incremental path used to lack.
+         */
+        if (led_zone_missed_count[zone_index] < DCMI_ZONE_MISS_HOLD_FRAMES) {
+            g_dcmi_zone_miss_hold_count++;
+        } else {
+            smoothed_led_zone_r[zone_index] =
+                (smoothed_led_zone_r[zone_index] * DCMI_ZONE_MISS_DECAY_NUM) /
+                DCMI_ZONE_MISS_DECAY_DEN;
+            smoothed_led_zone_g[zone_index] =
+                (smoothed_led_zone_g[zone_index] * DCMI_ZONE_MISS_DECAY_NUM) /
+                DCMI_ZONE_MISS_DECAY_DEN;
+            smoothed_led_zone_b[zone_index] =
+                (smoothed_led_zone_b[zone_index] * DCMI_ZONE_MISS_DECAY_NUM) /
+                DCMI_ZONE_MISS_DECAY_DEN;
+            g_dcmi_led_zone_r[zone_index] = smoothed_led_zone_r[zone_index];
+            g_dcmi_led_zone_g[zone_index] = smoothed_led_zone_g[zone_index];
+            g_dcmi_led_zone_b[zone_index] = smoothed_led_zone_b[zone_index];
+            decayed_zones++;
+            g_dcmi_zone_miss_decay_count++;
+        }
+        if (led_zone_missed_count[zone_index] < 0xFFFFFFFFU) {
+            led_zone_missed_count[zone_index]++;
+        }
     }
 
     for (uint32_t zone_index = DCMI_TOP_ZONE_OFFSET;
@@ -2654,7 +2755,7 @@ static void finalize_incremental_capture(void)
     g_dcmi_top_last_b = g_dcmi_led_zone_b[DCMI_LEFT_ZONE_OFFSET - 1U];
 
     g_dcmi_zone_update_count++;
-    if (updated_zones > 0U) {
+    if (updated_zones > 0U || decayed_zones > 0U) {
         g_dcmi_led_update_pending = 1U;
     } else {
         g_dcmi_frame_publish_skip_count++;

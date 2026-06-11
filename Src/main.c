@@ -45,7 +45,7 @@
  *   breakout SCL pad -> PB8
  *   breakout SDA pad -> PB9
  */
-#define EDID_WRITER_MODE 1U
+#define EDID_WRITER_MODE 0U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
