@@ -1237,12 +1237,13 @@ static void start_snapshot(void)
 
     /* Edge crops are tied to the source scanout. If a crop starts in the
      * middle of a frame, the target rows may already be gone and DMA will only
-     * fill a partial buffer. Wait for the next VSYNC for every crop.
-     *
-     * During the isolated side transport test, never start after a missed
-     * VSYNC: the previous experiment showed that the wait-timeout rate closely
-     * matched the remaining partial/zero capture rate. Keep the same crop
-     * queued and retry alignment on the next scheduler pass instead.
+     * fill a partial buffer. Wait for the next VSYNC for every crop, and
+     * never start after a missed VSYNC: the transport experiments showed the
+     * wait-timeout rate closely matched the partial/zero capture rate, and a
+     * blind start ingests misaligned data the acceptance logic then has to
+     * reject at the cost of a missed zone update. Keep the same crop queued
+     * and retry alignment on the next scheduler pass instead - on a healthy
+     * link this path never triggers (0 timeouts in 3221 waits, bench 2026-06).
      */
 #if DCMI_CROP_TEST_MODE || DCMI_PREARM_CAPTURE
     /* Arm capture before the next frame instead of consuming a VSYNC event
@@ -1258,7 +1259,6 @@ static void start_snapshot(void)
 #endif
 #else
     g_dcmi_sync_wait_status = wait_for_frame_boundary();
-#if DCMI_FULL_HEIGHT_SIDE_TEST_MODE
     if (g_dcmi_sync_wait_status == 0U) {
         g_dcmi_sync_start_skip_count++;
         last_restart_ms = HAL_GetTick();
@@ -1267,7 +1267,6 @@ static void start_snapshot(void)
         return;
     }
     active_sync_wait_ms = g_dcmi_sync_wait_ms;
-#endif
 #endif
 
     #if DCMI_BOTTOM_TIMED_BAND
