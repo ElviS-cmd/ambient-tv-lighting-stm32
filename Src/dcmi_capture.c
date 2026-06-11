@@ -194,10 +194,14 @@
 #define DCMI_FRAME_MIN_QUALITY_TO_PUBLISH 32U
 
 /* Observed per-channel black-floor from the data bus (after RGB332 expand).
- * Subtract these so black on the source produces (0,0,0) and the WS2812 gate
- * threshold becomes meaningful. Tune by displaying full black and reading the
- * g_dcmi_zone*_r/g/b values. */
-#define DCMI_BASELINE_R 45U
+ * Subtract these so black on the source produces (0,0,0). Tune by displaying
+ * full black and reading g_dcmi_observed_baseline_* (pre-rescale raw minima,
+ * diagnostics build). Bench 2026-06: raw black measured 0/0/0 on all three
+ * channels, so the legacy R floor of 45 - which crushed dark reds below 45
+ * to black and stretched the rest - was a relic of an earlier setup and is
+ * now zero. Re-measure after signal-path changes (EDID reprogram, dongle).
+ */
+#define DCMI_BASELINE_R 0U
 #define DCMI_BASELINE_G 0U
 #define DCMI_BASELINE_B 0U
 /* Zones whose raw level is at or below this snap to true zero so smoothing
