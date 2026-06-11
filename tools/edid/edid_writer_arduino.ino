@@ -8,9 +8,15 @@
  * UNPLUGGED while programming; the V+ wire powers the EEPROM and its
  * on-board 10k pull-ups, so the bus level follows whatever you feed V+.
  *
- *   ESP32-WROOM (3.3V logic - NEVER feed V+ from 5V/VIN here):
+ *   ESP32-S3-Zero (3.3V logic - NEVER feed V+ from 5V/VIN here).
+ *   IDE: board "ESP32S3 Dev Module", USB CDC On Boot = Enabled (the S3-Zero
+ *   has native USB only; without this the serial monitor stays silent):
  *     Black  GND -> GND      Red    V+  -> 3V3
- *     Blue   SDA -> GPIO21   Yellow SCL -> GPIO22
+ *     Blue   SDA -> GP5      Yellow SCL -> GP6
+ *   (GPIO21 is the S3-Zero's onboard RGB LED; GPIO22 does not exist on S3.)
+ *
+ *   Classic ESP32-WROOM (3.3V logic, same V+ warning):
+ *     Black  SDA -> GPIO21   Yellow SCL -> GPIO22, V+ -> 3V3
  *
  *   Arduino Uno/Nano (5V logic):
  *     Black  GND -> GND      Red    V+  -> 5V
@@ -102,8 +108,10 @@ static bool verifyAll(void) {
 
 void setup() {
   Serial.begin(115200);
-#if defined(ARDUINO_ARCH_ESP32)
-  Wire.begin(21, 22); /* SDA, SCL */
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  Wire.begin(5, 6); /* S3-Zero: SDA=GP5, SCL=GP6 (GP21 is the onboard LED) */
+#elif defined(ARDUINO_ARCH_ESP32)
+  Wire.begin(21, 22); /* classic ESP32: SDA, SCL */
 #else
   Wire.begin();
 #endif
