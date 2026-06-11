@@ -375,6 +375,7 @@ int main(void)
                               g_dcmi_led_zone_b,
                               DCMI_LED_ZONE_COUNT);
     }
+    WS2812_GlideTask();
     WS2812_Flush();
 
     /* USER CODE END WHILE */

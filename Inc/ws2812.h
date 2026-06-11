@@ -10,6 +10,7 @@ void WS2812_TaskEdgeZonesRgb(const volatile uint32_t *zone_r,
                              const volatile uint32_t *zone_g,
                              const volatile uint32_t *zone_b,
                              uint32_t zone_count);
+void WS2812_GlideTask(void);
 void WS2812_Flush(void);
 void WS2812_Clear(void);
 

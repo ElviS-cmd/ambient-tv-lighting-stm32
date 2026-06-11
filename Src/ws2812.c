@@ -39,6 +39,21 @@
 #define WS2812_WB_R_PCT 100U
 #define WS2812_WB_G_PCT 100U
 #define WS2812_WB_B_PCT 100U
+/* Output glide ("glow") engine. The capture pipeline updates each zone's
+ * TARGET color in discrete ~12 Hz steps (snaps included - that part stays
+ * fast). The glide ticks at 100 Hz and eases the actually-emitted color
+ * toward the target with a first-order response, so transitions render as
+ * continuous ramps instead of visible steps. Asymmetric time constants are
+ * what make it read as glow rather than flash: brightening is quick
+ * (attack), dimming trails off like an afterglow (release). Set both to 0
+ * to restore instant tracking for A/B comparison.
+ */
+#define WS2812_GLIDE_TICK_MS 10U
+#define WS2812_GLIDE_ATTACK_MS 60U
+#define WS2812_GLIDE_RELEASE_MS 250U
+/* Per-tick easing coefficient in q8: alpha = tick / (tick + tau). */
+#define WS2812_GLIDE_K(tau_ms) \
+    ((256U * WS2812_GLIDE_TICK_MS) / (WS2812_GLIDE_TICK_MS + (tau_ms)))
 #define WS2812_UPDATE_PERIOD_MS 12U
 #define WS2812_FAST_UPDATE_PERIOD_MS 7U
 #define WS2812_FAST_DELTA_THRESHOLD 24U
@@ -122,7 +137,16 @@ static const uint8_t ws2812_gamma_lut[256] = {
 };
 #endif
 
+/* ws2812_leds holds the TARGET colors from the capture pipeline; the glide
+ * engine eases ws2812_output toward them and the DMA buffer is encoded from
+ * ws2812_output. The q8.8 state keeps sub-LSB progress so slow fades have
+ * no visible stair-stepping. */
 static ws2812_color_t ws2812_leds[WS2812_LED_COUNT];
+static ws2812_color_t ws2812_output[WS2812_LED_COUNT];
+static uint16_t ws2812_glide_g_q88[WS2812_LED_COUNT];
+static uint16_t ws2812_glide_r_q88[WS2812_LED_COUNT];
+static uint16_t ws2812_glide_b_q88[WS2812_LED_COUNT];
+static uint32_t last_glide_tick_ms;
 static uint32_t ws2812_pwm_buf[WS2812_PWM_BUF_LEN] __attribute__((aligned(4)));
 static uint32_t ws2812_dma_available;
 /* Written from the TIM2 DMA-complete interrupt via ws2812_force_idle_low();
@@ -151,6 +175,7 @@ static void encode_dma_buffer(void);
 static uint32_t show_tim_dma(void);
 static uint32_t show(void);
 static uint8_t rgb_to_channel(uint32_t value, uint32_t wb_pct);
+static uint16_t glide_channel(uint16_t current_q88, uint8_t target);
 static inline uint32_t channel_delta_u8(uint8_t a, uint8_t b);
 static void ws2812_force_idle_low(void);
 
@@ -367,8 +392,71 @@ void WS2812_TaskEdgeZonesRgb(const volatile uint32_t *zone_r,
         g_ws2812_max_channel = max_channel;
     }
 
-    if (show() != 0U) {
-        last_update_ms = now;
+    /* Targets are set; WS2812_GlideTask() owns the actual transmission. */
+    last_update_ms = now;
+}
+
+static uint16_t glide_channel(uint16_t current_q88, uint8_t target)
+{
+    uint16_t target_q88 = (uint16_t)((uint16_t)target << 8);
+    uint32_t step;
+
+    if (target_q88 > current_q88) {
+        step = ((uint32_t)(target_q88 - current_q88) *
+                WS2812_GLIDE_K(WS2812_GLIDE_ATTACK_MS)) >> 8;
+        if (step == 0U) {
+            /* Close the sub-LSB remainder instead of parking one below. */
+            return target_q88;
+        }
+        return (uint16_t)(current_q88 + step);
+    }
+    if (target_q88 < current_q88) {
+        step = ((uint32_t)(current_q88 - target_q88) *
+                WS2812_GLIDE_K(WS2812_GLIDE_RELEASE_MS)) >> 8;
+        if (step == 0U) {
+            return target_q88;
+        }
+        return (uint16_t)(current_q88 - step);
+    }
+    return current_q88;
+}
+
+void WS2812_GlideTask(void)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t changed = 0U;
+
+    if ((now - last_glide_tick_ms) < WS2812_GLIDE_TICK_MS) {
+        return;
+    }
+    last_glide_tick_ms = now;
+
+    for (uint32_t i = 0U; i < WS2812_LED_COUNT; i++) {
+        uint8_t out;
+
+        ws2812_glide_g_q88[i] = glide_channel(ws2812_glide_g_q88[i], ws2812_leds[i].g);
+        ws2812_glide_r_q88[i] = glide_channel(ws2812_glide_r_q88[i], ws2812_leds[i].r);
+        ws2812_glide_b_q88[i] = glide_channel(ws2812_glide_b_q88[i], ws2812_leds[i].b);
+
+        out = (uint8_t)(ws2812_glide_g_q88[i] >> 8);
+        if (out != ws2812_output[i].g) {
+            ws2812_output[i].g = out;
+            changed = 1U;
+        }
+        out = (uint8_t)(ws2812_glide_r_q88[i] >> 8);
+        if (out != ws2812_output[i].r) {
+            ws2812_output[i].r = out;
+            changed = 1U;
+        }
+        out = (uint8_t)(ws2812_glide_b_q88[i] >> 8);
+        if (out != ws2812_output[i].b) {
+            ws2812_output[i].b = out;
+            changed = 1U;
+        }
+    }
+
+    if (changed != 0U) {
+        (void)show();
     }
 }
 
@@ -393,6 +481,12 @@ void WS2812_Clear(void)
         ws2812_leds[i].r = 0U;
         ws2812_leds[i].g = 0U;
         ws2812_leds[i].b = 0U;
+        ws2812_output[i].r = 0U;
+        ws2812_output[i].g = 0U;
+        ws2812_output[i].b = 0U;
+        ws2812_glide_g_q88[i] = 0U;
+        ws2812_glide_r_q88[i] = 0U;
+        ws2812_glide_b_q88[i] = 0U;
     }
 
     for (uint32_t zone = 0U; zone < WS2812_INPUT_ZONE_COUNT; zone++) {
@@ -541,9 +635,9 @@ static void encode_dma_buffer(void)
 
     for (uint32_t led = 0U; led < WS2812_LED_COUNT; led++) {
         uint8_t bytes[3] = {
-            ws2812_leds[led].g,
-            ws2812_leds[led].r,
-            ws2812_leds[led].b
+            ws2812_output[led].g,
+            ws2812_output[led].r,
+            ws2812_output[led].b
         };
 
         for (uint32_t byte_index = 0U; byte_index < 3U; byte_index++) {
