@@ -1,4 +1,5 @@
 #include "ws2812.h"
+#include "app_config.h"
 
 #define WS2812_GPIO_PORT GPIOA
 #define WS2812_GPIO_PIN  GPIO_PIN_1
@@ -32,8 +33,8 @@
  */
 #define WS2812_GAMMA_CORRECTION 0U
 /* Keep color summaries available while leaving DMA waveform validation off. */
-#define WS2812_COLOR_DIAGNOSTICS 1U
-#define WS2812_DMA_DIAGNOSTICS 1U
+#define WS2812_COLOR_DIAGNOSTICS APP_ENABLE_COLOR_DIAGNOSTICS
+#define WS2812_DMA_DIAGNOSTICS APP_ENABLE_WS2812_DIAGNOSTICS
 /* Per-channel white balance, percent of the gamma output. Tune with a full
  * white screen until the strip's white matches the display: WS2812 greens
  * usually dominate, so G is typically the channel to pull down first
@@ -95,53 +96,57 @@ typedef struct {
 extern TIM_HandleTypeDef htim2;
 extern DMA_HandleTypeDef hdma_tim2_ch2_ch4;
 
-volatile uint32_t g_ws2812_show_count;
-volatile uint32_t g_ws2812_dma_started_count;
-volatile uint32_t g_ws2812_dma_complete_count;
-volatile uint32_t g_ws2812_dma_error_count;
-volatile uint32_t g_ws2812_dma_busy;
-volatile uint32_t g_ws2812_clock_ok;
-volatile uint32_t g_ws2812_tim2_kernel_hz;
-volatile uint32_t g_ws2812_arr_expected;
-volatile uint32_t g_ws2812_arr_actual;
-volatile uint32_t g_ws2812_slot_hz;
-volatile uint32_t g_ws2812_nonzero_perimeter;
-volatile uint32_t g_ws2812_first_nonzero_index;
-volatile uint32_t g_ws2812_last_nonzero_index;
-volatile uint32_t g_ws2812_max_channel;
-volatile uint32_t g_ws2812_target_min_r;
-volatile uint32_t g_ws2812_target_max_r;
-volatile uint32_t g_ws2812_target_spread_r;
-volatile uint32_t g_ws2812_target_min_g;
-volatile uint32_t g_ws2812_target_max_g;
-volatile uint32_t g_ws2812_target_spread_g;
-volatile uint32_t g_ws2812_target_min_b;
-volatile uint32_t g_ws2812_target_max_b;
-volatile uint32_t g_ws2812_target_spread_b;
-volatile uint32_t g_ws2812_output_min_r;
-volatile uint32_t g_ws2812_output_max_r;
-volatile uint32_t g_ws2812_output_spread_r;
-volatile uint32_t g_ws2812_output_min_g;
-volatile uint32_t g_ws2812_output_max_g;
-volatile uint32_t g_ws2812_output_spread_g;
-volatile uint32_t g_ws2812_output_min_b;
-volatile uint32_t g_ws2812_output_max_b;
-volatile uint32_t g_ws2812_output_spread_b;
+static volatile uint32_t g_ws2812_show_count;
+static volatile uint32_t g_ws2812_dma_started_count;
+static volatile uint32_t g_ws2812_dma_complete_count;
+static volatile uint32_t g_ws2812_dma_error_count;
+static volatile uint32_t g_ws2812_dma_busy;
+static volatile uint32_t g_ws2812_clock_ok;
+static volatile uint32_t g_ws2812_tim2_kernel_hz;
+static volatile uint32_t g_ws2812_arr_expected;
+static volatile uint32_t g_ws2812_arr_actual;
+static volatile uint32_t g_ws2812_slot_hz;
+#if WS2812_COLOR_DIAGNOSTICS
+static volatile uint32_t g_ws2812_nonzero_perimeter;
+static volatile uint32_t g_ws2812_first_nonzero_index;
+static volatile uint32_t g_ws2812_last_nonzero_index;
+static volatile uint32_t g_ws2812_max_channel;
+static volatile uint32_t g_ws2812_target_min_r;
+static volatile uint32_t g_ws2812_target_max_r;
+static volatile uint32_t g_ws2812_target_spread_r;
+static volatile uint32_t g_ws2812_target_min_g;
+static volatile uint32_t g_ws2812_target_max_g;
+static volatile uint32_t g_ws2812_target_spread_g;
+static volatile uint32_t g_ws2812_target_min_b;
+static volatile uint32_t g_ws2812_target_max_b;
+static volatile uint32_t g_ws2812_target_spread_b;
+static volatile uint32_t g_ws2812_output_min_r;
+static volatile uint32_t g_ws2812_output_max_r;
+static volatile uint32_t g_ws2812_output_spread_r;
+static volatile uint32_t g_ws2812_output_min_g;
+static volatile uint32_t g_ws2812_output_max_g;
+static volatile uint32_t g_ws2812_output_spread_g;
+static volatile uint32_t g_ws2812_output_min_b;
+static volatile uint32_t g_ws2812_output_max_b;
+static volatile uint32_t g_ws2812_output_spread_b;
+#endif
+#if WS2812_DMA_DIAGNOSTICS
 /* Buffer-integrity instrumentation — populated by encode_dma_buffer()
  * and show_tim_dma() so you can verify CCR duty values in the debugger.
  * All should be 34 or 67 (data slots) / 0 (reset slots); overrange == 0. */
-volatile uint32_t g_ws2812_buf_min;          /* min value written to pwm buf  */
-volatile uint32_t g_ws2812_buf_max;          /* max value written to pwm buf  */
-volatile uint32_t g_ws2812_buf_overrange;    /* entries > ARR (should be 0)   */
-volatile uint32_t g_ws2812_buf_entry0;       /* pwm_buf[0] after encode       */
-volatile uint32_t g_ws2812_buf_entry1;       /* pwm_buf[1]                    */
-volatile uint32_t g_ws2812_buf_entry2;       /* pwm_buf[2]                    */
-volatile uint32_t g_ws2812_buf_entry3;       /* pwm_buf[3]                    */
-volatile uint32_t g_ws2812_ccr2_snapshot;    /* TIM2->CCR2 read after DMA start */
+static volatile uint32_t g_ws2812_buf_min;          /* min value written to pwm buf  */
+static volatile uint32_t g_ws2812_buf_max;          /* max value written to pwm buf  */
+static volatile uint32_t g_ws2812_buf_overrange;    /* entries > ARR (should be 0)   */
+static volatile uint32_t g_ws2812_buf_entry0;       /* pwm_buf[0] after encode       */
+static volatile uint32_t g_ws2812_buf_entry1;       /* pwm_buf[1]                    */
+static volatile uint32_t g_ws2812_buf_entry2;       /* pwm_buf[2]                    */
+static volatile uint32_t g_ws2812_buf_entry3;       /* pwm_buf[3]                    */
+static volatile uint32_t g_ws2812_ccr2_snapshot;    /* TIM2->CCR2 read after DMA start */
 /* Runtime DMA alignment — read from DMA1_Stream6->CR after each DMA start.
  * Encoding: 0=byte, 1=half-word, 2=word.  Both should be 2 (word). */
-volatile uint32_t g_ws2812_dma_msize;        /* CR bits[14:13] — memory width  */
-volatile uint32_t g_ws2812_dma_psize;        /* CR bits[12:11] — periph width  */
+static volatile uint32_t g_ws2812_dma_msize;        /* CR bits[14:13] — memory width  */
+static volatile uint32_t g_ws2812_dma_psize;        /* CR bits[12:11] — periph width  */
+#endif
 
 #if WS2812_GAMMA_CORRECTION
 /* round(96 * (v/255)^2.2) for v = 0..255. */
@@ -273,9 +278,9 @@ void WS2812_Init(void)
     WS2812_Clear();
 }
 
-void WS2812_TaskEdgeZonesRgb(const volatile uint32_t *zone_r,
-                             const volatile uint32_t *zone_g,
-                             const volatile uint32_t *zone_b,
+void WS2812_TaskEdgeZonesRgb(const uint32_t *zone_r,
+                             const uint32_t *zone_g,
+                             const uint32_t *zone_b,
                              uint32_t zone_count)
 {
     uint32_t now = HAL_GetTick();

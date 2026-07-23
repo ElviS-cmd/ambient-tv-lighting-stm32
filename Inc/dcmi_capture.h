@@ -2,6 +2,7 @@
 #define DCMI_CAPTURE_H
 
 #include "main.h"
+#include "app_config.h"
 
 /* Video source mode. Selects the expected frame geometry (dcmi_capture.c)
  * and the DCMI sync polarities (main.c) together, so geometry and polarity
@@ -18,19 +19,19 @@
  * 3 = splitter-compatible EDID: standard 720x480p @ 59.94/60 Hz, 27 MHz.
  *     Both sync pulses are negative -> LOW/LOW.
  */
-#define DCMI_SOURCE_MODE 0U
+#define DCMI_SOURCE_MODE APP_VIDEO_SOURCE_MODE
 
 /* The TFP401 updates its parallel data around one ODCK edge. Capture on the
  * opposite edge so DCMI samples in the middle of the stable data window.
  * Keep this switch explicit while validating the installed breakout.
  */
-#define DCMI_PCLK_CAPTURE_FALLING 0U
+#define DCMI_PCLK_CAPTURE_FALLING APP_DCMI_PCLK_FALLING
 
 #define DCMI_LED_ZONE_COUNT 136U
 
-extern volatile uint32_t g_dcmi_led_zone_r[DCMI_LED_ZONE_COUNT];
-extern volatile uint32_t g_dcmi_led_zone_g[DCMI_LED_ZONE_COUNT];
-extern volatile uint32_t g_dcmi_led_zone_b[DCMI_LED_ZONE_COUNT];
+extern uint32_t g_dcmi_led_zone_r[DCMI_LED_ZONE_COUNT];
+extern uint32_t g_dcmi_led_zone_g[DCMI_LED_ZONE_COUNT];
+extern uint32_t g_dcmi_led_zone_b[DCMI_LED_ZONE_COUNT];
 
 void DCMI_Capture_Init(void);
 void DCMI_Capture_Task(void);

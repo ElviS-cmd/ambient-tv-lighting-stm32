@@ -21,8 +21,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "dcmi_capture.h" //video capture
-#include "ws2812.h" //led strip driver
+#include "app_config.h"
+#include "dcmi_capture.h"
+#include "ws2812.h"
 
 /* USER CODE END Includes */
 
@@ -35,14 +36,14 @@
 /* USER CODE BEGIN PD */
 
 
-#define TFP401_SIGNAL_DIAGNOSTIC_MODE 0U
+#define TFP401_SIGNAL_DIAGNOSTIC_MODE APP_ENABLE_TFP401_SIGNAL_DIAGNOSTIC
 /* Passive signal monitor for normal DCMI operation. It samples the DCMI GPIO
  * inputs from the main loop and accumulates transitions without taking over
  * the pipeline or changing the pin configuration.
  */
-#define TFP401_SIGNAL_MONITOR 1U // led strip output self test
+#define TFP401_SIGNAL_MONITOR APP_ENABLE_TFP401_SIGNAL_MONITOR
 
-#define LED_STRIP_SELF_TEST_MODE 0U
+#define LED_STRIP_SELF_TEST_MODE APP_ENABLE_LED_SELF_TEST
 #define LED_RANDOM_COLOR_HOLD_MS 250U
 #define LED_RANDOM_OFF_HOLD_MS    80U
 #define LED_RANDOM_MAX_CHANNEL    80U

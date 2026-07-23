@@ -58,17 +58,6 @@ diagram, level-shifter pinout, capacitor placement, and power notes.
 See [docs/tfp401_pin_map.md](docs/tfp401_pin_map.md) for the TFP401-to-STM32
 DCMI wiring.
 
-### Custom STM32H563 PCB Portfolio Extension
-
-The repository also contains a separate, unbuilt STM32H563 controller-board
-design that replaces the Discovery board and loose interconnects with a
-four-layer custom PCB. It includes the native KiCad schematic/layout, exact
-BOM and pin map, deterministic routing scripts, automated ECAD verification,
-an independent second-opinion review, and reproducible manufacturing-output
-generation.
-
-See [hardware/ambient_controller_h563/README.md](hardware/ambient_controller_h563/README.md).
-
 ## Firmware Pipeline
 
 1. The TFP401 presents RGB332 pixels plus pixel-clock, HSYNC, and VSYNC signals.
@@ -104,48 +93,16 @@ to 24 physical LEDs.
 - Logical 1 compare value: `67`
 - WS2812 reset slots: `48` (`60 us` low at 800 kHz)
 
-## Key Firmware Flags
+## Configuration
 
-All in `Src/dcmi_capture.c`:
+Release-facing options live in `Inc/app_config.h`. This file selects the video
+source and pixel-clock edge and controls all standalone tests and passive
+diagnostics. Instrumentation is disabled by default so production builds do
+not pay its CPU or memory cost.
 
-| Flag | Default | Purpose |
-|---|---|---|
-| `DCMI_FULL_HEIGHT_SIDE_TEST_MODE` | `1` | Transport test: cycles four `28x180` vertical segments on both sides after complete `28x720` restart-per-side crops failed validation. It records whether segments meet the 50 ms production target, then permits an 80 ms recovery window. **Does not drive the LEDs.** Set to `0` for normal operation. |
-| `DCMI_PREARM_CAPTURE` | `0` | Current transport experiment: wait for the next VSYNC before starting each crop. Immediate re-arm produced roughly 20% zero captures; a missed VSYNC now keeps the crop queued for another alignment attempt instead of launching DMA unsynchronized. |
-| `DCMI_SIDE_VERTICAL_CROPS` | `1` | Production side strategy: full-height 28x720 side crops; all side zones refresh every ~4-capture perimeter cycle. Set to `0` to fall back to the proven 1280x16 horizontal side bands. |
-| `DCMI_DIAGNOSTICS` | `0` | Compiles the per-sample debug statistics (bit histogram, checksums, byte min/max) back into `analyze_buffer()`. Costs more CPU than the LED path itself; enable only while debugging. |
-| `DCMI_BLACK_BORDER_DETECT` | `1` | Letterbox/pillarbox detection: edges that stay black while other edges show content walk their crops inward onto the picture; periodic outward probes snap back when the bars disappear. Watch `g_dcmi_border_inset[]` in the debugger. |
-
-The Debug build configuration compiles at `-O2`; telemetry globals are
-`volatile` so live debugger watches keep working under optimization.
-
-`tools/latency_sim.c` is a host-side model of the capture schedulers and
-smoothing policies, and `tools/border_sim.c` exercises the black-border
-detector against letterbox, pillarbox, dark-scene, and fullscreen-return
-scenarios (`cc -O2 -Wall -o sim <file>.c && ./sim`).
-
-## Bench Checklist (next hardware session)
-
-1. Flash as-is and run the segmented side transport test on a fast-motion
-   clip. Watch `g_dcmi_side_test_verdict_by_segment[1][0..3]` (right) and
-   `[3][0..3]` (left): `0` means fewer than 100 attempts collected, `1` means
-   pass, and `2` means fail. Every segment must pass. A pass requires at least
-   95% full/near-full captures and no more than 1% zero captures within the
-   80 ms recovery window. Compare
-   `g_dcmi_side_test_full_within_target_permille[]` against
-   `g_dcmi_side_test_late_full_by_edge[]`: late full crops identify a
-   start/VSYNC phase problem even if the recovery verdict passes.
-2. If the verdict is good: set `DCMI_FULL_HEIGHT_SIDE_TEST_MODE` to `0` and
-   verify the strip; side edges should now track motion within ~100 ms.
-3. If full-height crops are unreliable: also set `DCMI_SIDE_VERTICAL_CROPS`
-   to `0` to restore the horizontal-band pipeline.
-4. Sanity-check the new behavior: scene cuts should land on the next
-   perimeter pass (watch `g_dcmi_global_cut_count`), and LED updates landing
-   during a strip transmission are deferred, not dropped.
-5. Play a letterboxed YouTube video: within ~4 seconds the top/bottom LEDs
-   should pick up the picture instead of staying dark
-   (`g_dcmi_border_inset[0]`/`[2]` settle around the bar height), and going
-   fullscreen should snap them back within a few seconds.
+The lower-level capture and LED tuning constants remain private to their
+respective modules. Change them only with a repeatable bench test and document
+the result in the commit that introduces the change.
 
 ## Building and Flashing
 
@@ -159,28 +116,28 @@ Before powering the LED strip, verify the wiring in
 [docs/hardware_wiring.md](docs/hardware_wiring.md), especially the shared ground
 and external 5 V LED supply.
 
+See [docs/architecture.md](docs/architecture.md) for module responsibilities,
+state ownership, and the release validation policy.
+
 ## Repository Layout
 
 ```text
-Inc/                  Application and generated headers
-Src/                  Application and generated source files
+Inc/                  Public interfaces, release configuration, generated headers
+Src/                  Firmware implementation and generated source files
 Startup/              STM32 startup assembly
 Drivers/              STM32 HAL and CMSIS dependencies
-hardware/             Custom STM32H563 four-layer PCB portfolio design
 docs/                 Hardware and signal documentation
 led flash.ioc         STM32CubeMX project configuration
 ```
 
 ## Current Status
 
-The complete capture-to-light pipeline is operational. The June 2026 latency
-work rebuilt the analysis hot path around lookup tables (verified equivalent
-on 1.15M pixel positions), moved debug statistics behind a compile flag,
-added scene-cut snapping with capture-wide scene-change detection, and
-removed the fixed scheduling delays. A full-height vertical side-crop
-scheduler is implemented and waiting on the side transport test verdict
-(see the bench checklist above); until then the firmware ships in transport
-test mode.
+The complete capture-to-light pipeline is operational. The production
+configuration uses VSYNC-aligned DCMI/DMA capture, cached zone mapping,
+adaptive smoothing, black-border detection, and deferred WS2812 updates.
+Bench-only signal monitors, self-tests, color summaries, and DMA waveform
+instrumentation remain available through `Inc/app_config.h` but are disabled
+in the release configuration.
 
 ## Engineering Lessons
 
