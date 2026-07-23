@@ -1,0 +1,34 @@
+name: Firmware build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Arm GNU toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-arm-none-eabi
+
+      - name: Build configuration matrix
+        run: make check
+
+      - name: Upload release firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: ambient-tv-lighting-firmware
+          path: |
+            build-release/ambient-tv-lighting.elf
+            build-release/ambient-tv-lighting.hex
+            build-release/ambient-tv-lighting.bin
+            build-release/ambient-tv-lighting.map
