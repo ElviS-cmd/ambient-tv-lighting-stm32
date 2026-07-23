@@ -2945,8 +2945,9 @@ static uint32_t zone_in_current_capture(uint32_t zone_index)
      * belongs to this capture.
      */
     if (active_crop_index == DCMI_EDGE_RIGHT) {
-        return (zone_index >= DCMI_RIGHT_ZONE_OFFSET &&
-                zone_index < DCMI_RIGHT_ZONE_OFFSET + DCMI_RIGHT_ZONE_COUNT) ? 1U : 0U;
+        return zone_index < DCMI_RIGHT_ZONE_OFFSET + DCMI_RIGHT_ZONE_COUNT
+                   ? 1U
+                   : 0U;
     }
     if (active_crop_index == DCMI_EDGE_LEFT) {
         return (zone_index >= DCMI_LEFT_ZONE_OFFSET &&

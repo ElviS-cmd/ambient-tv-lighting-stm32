@@ -106,6 +106,19 @@ the result in the commit that introduces the change.
 
 ## Building and Flashing
 
+For a portable command-line build:
+
+```sh
+make
+```
+
+The resulting ELF, HEX, BIN, map, disassembly, and intermediate files are
+written below `build/`. The same build runs automatically for pushes and pull
+requests, where the flashable outputs are retained as a workflow artifact.
+
+Run `make check` to compile the release, diagnostics, all four video-source
+modes, and each standalone bench mode with warnings treated as a failed check.
+
 1. Install STM32CubeIDE and the STM32CubeF4 firmware package.
 2. Clone this repository.
 3. Import the directory as an existing STM32CubeIDE project.
@@ -118,6 +131,12 @@ and external 5 V LED supply.
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities,
 state ownership, and the release validation policy.
+Use [docs/release_checklist.md](docs/release_checklist.md) before merging a
+release candidate.
+Post-release refactoring priorities are recorded in
+[docs/maintenance_roadmap.md](docs/maintenance_roadmap.md).
+Development and review conventions are documented in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Repository Layout
 
