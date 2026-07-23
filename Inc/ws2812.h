@@ -13,5 +13,6 @@ void WS2812_TaskEdgeZonesRgb(const volatile uint32_t *zone_r,
 void WS2812_GlideTask(void);
 void WS2812_Flush(void);
 void WS2812_Clear(void);
+void WS2812_TestSolidRgb(uint8_t r, uint8_t g, uint8_t b);
 
 #endif

@@ -22,6 +22,9 @@ Release/
 # Editor and tooling state
 .vscode/
 .idea/
+.claude/
+**/__pycache__/
+*.py[cod]
 *.swp
 *~
 

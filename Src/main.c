@@ -21,8 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "dcmi_capture.h"
-#include "ws2812.h"
+#include "dcmi_capture.h" //video capture
+#include "ws2812.h" //led strip driver
 
 /* USER CODE END Includes */
 
@@ -33,19 +33,19 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* Temporary bench tool: turn this Discovery board into a programmer for the
- * TFP401 breakout's EDID EEPROM (the square SDA/SCL/GND/+5V pads next to its
- * HDMI port). Set to 1, flash, follow the LED/Live-Expressions flow in
- * edid_writer_run(), then set back to 0 and reflash the ambilight firmware.
- *
- * Wiring (TFP401 disconnected from HDMI and USB while programming):
- *   breakout +5V pad -> Discovery 3V   (EEPROM runs fine at 3.3 V and this
- *                                       keeps the I2C levels at 3.3 V)
- *   breakout GND pad -> Discovery GND
- *   breakout SCL pad -> PB8
- *   breakout SDA pad -> PB9
+
+
+#define TFP401_SIGNAL_DIAGNOSTIC_MODE 0U
+/* Passive signal monitor for normal DCMI operation. It samples the DCMI GPIO
+ * inputs from the main loop and accumulates transitions without taking over
+ * the pipeline or changing the pin configuration.
  */
-#define EDID_WRITER_MODE 0U
+#define TFP401_SIGNAL_MONITOR 1U // led strip output self test
+
+#define LED_STRIP_SELF_TEST_MODE 0U
+#define LED_RANDOM_COLOR_HOLD_MS 250U
+#define LED_RANDOM_OFF_HOLD_MS    80U
+#define LED_RANDOM_MAX_CHANNEL    80U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -61,6 +61,23 @@ TIM_HandleTypeDef htim2;
 DMA_HandleTypeDef hdma_tim2_ch2_ch4;
 
 /* USER CODE BEGIN PV */
+#if TFP401_SIGNAL_DIAGNOSTIC_MODE || TFP401_SIGNAL_MONITOR
+volatile uint32_t g_tfp401_pclk_transitions;
+volatile uint32_t g_tfp401_hsync_transitions;
+volatile uint32_t g_tfp401_vsync_transitions;
+volatile uint32_t g_tfp401_pclk_last;
+volatile uint32_t g_tfp401_hsync_last;
+volatile uint32_t g_tfp401_vsync_last;
+volatile uint32_t g_tfp401_data_transitions;
+volatile uint32_t g_tfp401_data_sample_count;
+volatile uint32_t g_tfp401_data_last;
+volatile uint32_t g_tfp401_data_high_percent[8];
+volatile uint32_t g_tfp401_data_bit_transitions[8];
+#endif
+
+#if LED_STRIP_SELF_TEST_MODE
+volatile uint32_t g_led_self_test_phase;
+#endif
 
 /* USER CODE END PV */
 
@@ -77,6 +94,195 @@ static void MX_TIM2_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+#if TFP401_SIGNAL_DIAGNOSTIC_MODE || TFP401_SIGNAL_MONITOR
+static uint32_t tfp401_read_data(void)
+{
+    uint32_t data = 0U;
+
+    data |= (GPIOC->IDR >> 6U) & 0x0FU;       /* D0..D3: PC6..PC9 */
+    data |= ((GPIOE->IDR >> 4U) & 0x01U) << 4U; /* D4: PE4 */
+    data |= ((GPIOB->IDR >> 6U) & 0x01U) << 5U; /* D5: PB6 */
+    data |= ((GPIOE->IDR >> 5U) & 0x03U) << 6U; /* D6,D7: PE5,PE6 */
+    return data;
+}
+#endif
+
+#if TFP401_SIGNAL_DIAGNOSTIC_MODE
+static void tfp401_signal_diagnostic_run(void)
+{
+    for (;;) {
+        uint32_t previous_pclk = (GPIOA->IDR & GPIO_PIN_6) != 0U;
+        uint32_t previous_hsync = (GPIOA->IDR & GPIO_PIN_4) != 0U;
+        uint32_t previous_vsync = (GPIOB->IDR & GPIO_PIN_7) != 0U;
+        uint32_t previous_data = tfp401_read_data();
+        uint32_t started = HAL_GetTick();
+        uint32_t pclk_transitions = 0U;
+        uint32_t hsync_transitions = 0U;
+        uint32_t vsync_transitions = 0U;
+        uint32_t data_transitions = 0U;
+        uint32_t data_sample_count = 0U;
+        uint32_t data_high_count[8] = {0U};
+        uint32_t data_bit_transitions[8] = {0U};
+
+        while ((HAL_GetTick() - started) < 250U) {
+            uint32_t pclk = (GPIOA->IDR & GPIO_PIN_6) != 0U;
+            uint32_t hsync = (GPIOA->IDR & GPIO_PIN_4) != 0U;
+            uint32_t vsync = (GPIOB->IDR & GPIO_PIN_7) != 0U;
+            uint32_t data = tfp401_read_data();
+
+            pclk_transitions += pclk != previous_pclk;
+            hsync_transitions += hsync != previous_hsync;
+            vsync_transitions += vsync != previous_vsync;
+            data_transitions += data != previous_data;
+            for (uint32_t bit = 0U; bit < 8U; bit++) {
+                data_high_count[bit] += (data >> bit) & 0x01U;
+                data_bit_transitions[bit] +=
+                    ((data ^ previous_data) >> bit) & 0x01U;
+            }
+            data_sample_count++;
+            previous_pclk = pclk;
+            previous_hsync = hsync;
+            previous_vsync = vsync;
+            previous_data = data;
+        }
+
+        g_tfp401_pclk_transitions = pclk_transitions;
+        g_tfp401_hsync_transitions = hsync_transitions;
+        g_tfp401_vsync_transitions = vsync_transitions;
+        g_tfp401_data_transitions = data_transitions;
+        g_tfp401_data_sample_count = data_sample_count;
+        g_tfp401_data_last = previous_data;
+        for (uint32_t bit = 0U; bit < 8U; bit++) {
+            g_tfp401_data_high_percent[bit] =
+                data_sample_count != 0U
+                    ? (data_high_count[bit] * 100U) / data_sample_count
+                    : 0U;
+            g_tfp401_data_bit_transitions[bit] = data_bit_transitions[bit];
+        }
+
+        HAL_GPIO_WritePin(GPIOD, LD4_Pin,
+                          pclk_transitions != 0U ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOD, LD3_Pin,
+                          hsync_transitions != 0U ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOD, LD5_Pin,
+                          vsync_transitions != 0U ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOD, LD6_Pin,
+                          data_transitions != 0U ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    }
+}
+#endif
+
+#if LED_STRIP_SELF_TEST_MODE
+static void led_test_set_status_leds(uint32_t mask)
+{
+    HAL_GPIO_WritePin(GPIOD, LD4_Pin,
+                      (mask & 0x1U) != 0U ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOD, LD3_Pin,
+                      (mask & 0x2U) != 0U ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOD, LD5_Pin,
+                      (mask & 0x4U) != 0U ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOD, LD6_Pin,
+                      (mask & 0x8U) != 0U ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void led_test_show(uint8_t r, uint8_t g, uint8_t b, uint32_t status_mask)
+{
+    led_test_set_status_leds(status_mask);
+    WS2812_TestSolidRgb(r, g, b);
+}
+
+static void led_test_hold(uint32_t duration_ms)
+{
+    uint32_t started = HAL_GetTick();
+
+    while ((HAL_GetTick() - started) < duration_ms) {
+        /* A frame requested while the previous DMA transfer is finishing is
+         * deferred. Keep flushing so every synthetic test color reaches DIN.
+         */
+        WS2812_Flush();
+        HAL_Delay(1U);
+    }
+}
+
+static uint32_t led_test_random_next(uint32_t *state)
+{
+    uint32_t value = *state;
+
+    value ^= value << 13U;
+    value ^= value >> 17U;
+    value ^= value << 5U;
+    *state = value;
+    return value;
+}
+
+static void led_strip_self_test_run(void)
+{
+    uint32_t random_state = 0x6D2B79F5U;
+
+    WS2812_Init();
+
+    for (;;) {
+        uint32_t random = led_test_random_next(&random_state);
+        uint8_t r = (uint8_t)(random % (LED_RANDOM_MAX_CHANNEL + 1U));
+        uint8_t g = (uint8_t)((random >> 8U) % (LED_RANDOM_MAX_CHANNEL + 1U));
+        uint8_t b = (uint8_t)((random >> 16U) % (LED_RANDOM_MAX_CHANNEL + 1U));
+
+        /* Keep every test frame clearly visible without requesting full-strip
+         * maximum current from a random near-white combination. */
+        if (r < 24U && g < 24U && b < 24U) {
+            b = 48U;
+        }
+
+        g_led_self_test_phase++;
+        led_test_show(r, g, b, g_led_self_test_phase & 0x0FU);
+        led_test_hold(LED_RANDOM_COLOR_HOLD_MS);
+
+        led_test_show(0U, 0U, 0U, 0U);
+        led_test_hold(LED_RANDOM_OFF_HOLD_MS);
+    }
+}
+#endif
+
+#if TFP401_SIGNAL_MONITOR
+static void tfp401_signal_monitor_task(void)
+{
+    static uint32_t initialized;
+    static uint32_t previous_pclk;
+    static uint32_t previous_hsync;
+    static uint32_t previous_vsync;
+    static uint32_t previous_data;
+    uint32_t pclk = (GPIOA->IDR & GPIO_PIN_6) != 0U;
+    uint32_t hsync = (GPIOA->IDR & GPIO_PIN_4) != 0U;
+    uint32_t vsync = (GPIOB->IDR & GPIO_PIN_7) != 0U;
+    uint32_t data = tfp401_read_data();
+
+    if (initialized != 0U) {
+        uint32_t changed_data = data ^ previous_data;
+
+        g_tfp401_pclk_transitions += pclk != previous_pclk;
+        g_tfp401_hsync_transitions += hsync != previous_hsync;
+        g_tfp401_vsync_transitions += vsync != previous_vsync;
+        g_tfp401_data_transitions += changed_data != 0U;
+        for (uint32_t bit = 0U; bit < 8U; bit++) {
+            g_tfp401_data_bit_transitions[bit] +=
+                (changed_data >> bit) & 0x01U;
+        }
+    } else {
+        initialized = 1U;
+    }
+
+    g_tfp401_data_sample_count++;
+    g_tfp401_data_last = data;
+    g_tfp401_pclk_last = pclk;
+    g_tfp401_hsync_last = hsync;
+    g_tfp401_vsync_last = vsync;
+    previous_pclk = pclk;
+    previous_hsync = hsync;
+    previous_vsync = vsync;
+    previous_data = data;
+}
+#endif
+
 #if EDID_WRITER_MODE
 /* Bit-banged I2C master (~25 kHz, open-drain with internal pull-ups) for the
  * 24C02-class EDID EEPROM at address 0x50 on the TFP401 breakout's pads.
@@ -92,15 +298,19 @@ static void MX_TIM2_Init(void);
  */
 #define EDID_EE_ADDR 0x50U
 
+/* Keep this byte-for-byte in sync with
+ * tools/edid/tfp401_720x480p60_compat.bin. This deliberately advertises one
+ * standard 27 MHz DVI timing and no extension block so simple splitter EDID
+ * parsers have nothing unusual to merge or reject. */
 static const uint8_t edid_image[128] = {
-    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x04, 0x81, 0x20, 0x07, 0x01, 0x00, 0x00, 0x00,
-    0x01, 0x24, 0x01, 0x03, 0x80, 0x0F, 0x0A, 0x78, 0x02, 0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26,
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x04, 0x81, 0x80, 0x04, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x24, 0x01, 0x03, 0x80, 0x10, 0x09, 0x78, 0x0A, 0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26,
     0x0F, 0x50, 0x54, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0xB4, 0x14, 0x00, 0xA0, 0x50, 0xD0, 0x11, 0x20, 0x30, 0x20,
-    0x35, 0x00, 0x6C, 0x44, 0x00, 0x00, 0x00, 0x1A, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x41, 0x4D, 0x42,
-    0x49, 0x4C, 0x49, 0x47, 0x48, 0x54, 0x0A, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xFD, 0x00, 0x17,
-    0x4C, 0x1E, 0x2E, 0x06, 0x0A, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x10,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2E
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x8C, 0x0A, 0xD0, 0x8A, 0x20, 0xE0, 0x2D, 0x10, 0x10, 0x3E,
+    0x96, 0x00, 0xA0, 0x5A, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x54, 0x46, 0x50,
+    0x34, 0x30, 0x31, 0x20, 0x34, 0x38, 0x30, 0x50, 0x0A, 0x20, 0x00, 0x00, 0x00, 0xFD, 0x00, 0x3B,
+    0x3D, 0x1E, 0x20, 0x03, 0x00, 0x0A, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x10,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10
 };
 
 /* 0=init 1=eeprom-no-ack 2=armed 3=writing 4=verifying 5=OK
@@ -352,8 +562,14 @@ int main(void)
   MX_DCMI_Init();
   MX_TIM2_Init();
 
+#if TFP401_SIGNAL_DIAGNOSTIC_MODE
+  tfp401_signal_diagnostic_run(); /* never returns */
+#elif LED_STRIP_SELF_TEST_MODE
+  led_strip_self_test_run(); /* never returns */
+#else
   DCMI_Capture_Init();
   WS2812_Init();
+#endif
   /* USER CODE BEGIN 2 */
 #if EDID_WRITER_MODE
   edid_writer_run(); /* never returns; see flow notes above */
@@ -364,6 +580,9 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+#if TFP401_SIGNAL_MONITOR
+    tfp401_signal_monitor_task();
+#endif
     /* No HAL_Delay here: capture completion is detected by polling the DMA
      * counter, so a 1 ms sleep per pass adds milliseconds of latency to
      * every capture. The loop is naturally paced by the video frame rate.
@@ -447,10 +666,12 @@ static void MX_DCMI_Init(void)
   /* USER CODE END DCMI_Init 1 */
   hdcmi.Instance = DCMI;
   hdcmi.Init.SynchroMode = DCMI_SYNCHRO_HARDWARE;
-  /* Runtime tests show this TFP401 path produces data with active-high
-   * HSYNC and none with active-low HSYNC.
-   */
+  /* Mode-specific sync polarity is applied after HAL initialization. */
+#if DCMI_PCLK_CAPTURE_FALLING
+  hdcmi.Init.PCKPolarity = DCMI_PCKPOLARITY_FALLING;
+#else
   hdcmi.Init.PCKPolarity = DCMI_PCKPOLARITY_RISING;
+#endif
   hdcmi.Init.VSPolarity = DCMI_VSPOLARITY_HIGH;
   hdcmi.Init.HSPolarity = DCMI_HSPOLARITY_HIGH;
   hdcmi.Init.CaptureRate = DCMI_CR_ALL_FRAME;
@@ -468,9 +689,11 @@ static void MX_DCMI_Init(void)
    * The HIGH/HIGH init above matches mode 0 (CEA 720p, positive pulses).
    * Overridden here in user code so CubeMX regeneration keeps it.
    */
-#if DCMI_SOURCE_MODE == 1U
-  /* Stock TFP401 EDID 800x480: both sync pulses negative -> blanking LOW. */
-  DCMI->CR &= ~(DCMI_CR_VSPOL | DCMI_CR_HSPOL);
+#if DCMI_SOURCE_MODE == 1U || DCMI_SOURCE_MODE == 3U
+  /* TFP401 display sync pulses mark blanking. DCMI needs the opposite,
+   * active-video qualification; the hardware sweep selects HIGH/HIGH.
+   */
+  DCMI->CR |= DCMI_CR_VSPOL | DCMI_CR_HSPOL;
 #elif DCMI_SOURCE_MODE == 2U
   /* AMBILIGHT 720p50-RB EDID: HSync positive, VSync negative. */
   DCMI->CR &= ~DCMI_CR_VSPOL;

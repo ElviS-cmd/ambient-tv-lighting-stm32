@@ -58,6 +58,17 @@ diagram, level-shifter pinout, capacitor placement, and power notes.
 See [docs/tfp401_pin_map.md](docs/tfp401_pin_map.md) for the TFP401-to-STM32
 DCMI wiring.
 
+### Custom STM32H563 PCB Portfolio Extension
+
+The repository also contains a separate, unbuilt STM32H563 controller-board
+design that replaces the Discovery board and loose interconnects with a
+four-layer custom PCB. It includes the native KiCad schematic/layout, exact
+BOM and pin map, deterministic routing scripts, automated ECAD verification,
+an independent second-opinion review, and reproducible manufacturing-output
+generation.
+
+See [hardware/ambient_controller_h563/README.md](hardware/ambient_controller_h563/README.md).
+
 ## Firmware Pipeline
 
 1. The TFP401 presents RGB332 pixels plus pixel-clock, HSYNC, and VSYNC signals.
@@ -155,6 +166,7 @@ Inc/                  Application and generated headers
 Src/                  Application and generated source files
 Startup/              STM32 startup assembly
 Drivers/              STM32 HAL and CMSIS dependencies
+hardware/             Custom STM32H563 four-layer PCB portfolio design
 docs/                 Hardware and signal documentation
 led flash.ioc         STM32CubeMX project configuration
 ```
